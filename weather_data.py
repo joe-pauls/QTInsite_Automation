@@ -1,66 +1,249 @@
-# weather_data.py
 """
-Weather helper module for Reporting.py
+Weather Data Integration Module
 
-Provides:
-- get_hourly_weather(start_date, end_date, icao_code)
-- match_weather_to_resistance(res_df, hourly_df)
-- create_weather_plot_png(matched_weather_df, daily_df, out_png)
+Provides weather data fetching, matching, and visualization for Circuit Integrity Reports.
 
-Depends on the same packages used previously in your uploaded script:
-  - pandas, numpy, plotly, openmeteo_requests, requests_cache, airportsdata, retry_requests
-(If you already have these installed for Reporting.py, no extra installs needed.)
+This module integrates with Open-Meteo Archive API to fetch historical weather data
+from nearby airport stations and correlates it with resistance measurements.
+
+Features:
+- Fetch hourly weather data (temperature, humidity, precipitation)
+- Match weather data to resistance measurement timestamps
+- Generate weather visualization plots matching resistance plot styling
+
+Dependencies:
+- openmeteo_requests: Open-Meteo API client
+- requests_cache: HTTP request caching
+- airportsdata: Airport location database
+- retry_requests: Request retry logic
+- pandas, numpy, plotly: Data processing and visualization
+
+Author: Joseph Pauls
 """
+
 from pathlib import Path
 import pandas as pd
 import numpy as np
 from datetime import timedelta
 import plotly.graph_objects as go
 
-# --- If you have the openmeteo / airport utilities in your uploaded script, import them ---
-# The uploaded weather script used: openmeteo_requests, requests_cache, airportsdata, retry_requests
-# If those modules are available in your environment, uncomment imports below and use the fetch function.
+# ========== DEPENDENCY CHECKS ==========
 try:
     import openmeteo_requests
     import requests_cache
     import airportsdata
     from retry_requests import retry
     _HAS_OPENMETEO = True
-except Exception:
+except ImportError:
     _HAS_OPENMETEO = False
-    # If openmeteo modules aren't available, user must provide hourly_df/daily_df manually or install libs.
+    # If openmeteo modules aren't available, user must install:
+    # pip install openmeteo-requests requests-cache airportsdata retry-requests
 
-# --- Public functions ---
+# ========== CONFIGURATION ==========
+# Atlantic Electric brand colors (matching Reporting.py)
+ATLANTIC_RED = "#A6192E"
+DARK_GRAY = "#231F20"
+LIGHT_GRAY = "#E6E6E6"
 
-def get_hourly_weather(start_date, end_date, icao_code="KCAE"):
+# Weather plot colors
+TEMP_COLOR = ATLANTIC_RED  # Temperature uses brand red
+HUM_COLOR = "#2A66D9"      # Humidity uses blue
+RAIN_COLOR = "#4C4EA3"     # Rainfall uses darker blue/purple
+
+# Default timezone for weather data
+TIMEZONE = "America/New_York"
+
+# Weather API configuration
+WEATHER_API_URL = "https://archive-api.open-meteo.com/v1/archive"
+CACHE_DIR = ".cache"
+API_RETRY_COUNT = 5
+API_RETRY_BACKOFF = 0.2
+
+# Font sizes (matching resistance plot)
+TITLE_FONT_SIZE = 24
+AXIS_LABEL_FONT_SIZE = 18
+TICK_FONT_SIZE = 16
+DATE_LABEL_FONT_SIZE = 16
+LEGEND_FONT_SIZE = 16
+# ====================================
+# ========== HELPER FUNCTIONS ==========
+
+def _icao_to_coordinates(icao_code: str) -> tuple[float | None, float | None]:
     """
-    Fetch hourly weather (temperature_2m, relative_humidity_2m, precipitation) and daily precipitation sums.
-    Returns (hourly_df, daily_df, airport_name).
-    hourly_df: column 'date' is timezone-aware in America/New_York
-    daily_df: column 'date' is timezone-aware in America/New_York (midnight)
+    Convert ICAO airport code to latitude/longitude coordinates.
+    
+    Args:
+        icao_code: Four-letter ICAO airport code (e.g., "KCAE")
+        
+    Returns:
+        Tuple of (latitude, longitude) or (None, None) if code invalid
     """
+    airports = airportsdata.load()
+    if icao_code in airports:
+        return airports[icao_code]['lat'], airports[icao_code]['lon']
+    return None, None
+
+
+def _get_airport_name(icao_code: str) -> str:
+    """
+    Get airport name from ICAO code.
+    
+    Args:
+        icao_code: Four-letter ICAO airport code
+        
+    Returns:
+        Airport name, or the ICAO code if not found
+    """
+    airports = airportsdata.load()
+    if icao_code in airports:
+        return airports[icao_code]["name"]
+    return icao_code
+
+
+def _calculate_tick_frequency(start: pd.Timestamp, end: pd.Timestamp) -> str:
+    """
+    Determine appropriate tick frequency based on time span.
+    
+    Args:
+        start: Start timestamp
+        end: End timestamp
+        
+    Returns:
+        Frequency string ('10min', '15min', '30min', or '1H')
+    """
+    span_seconds = (end - start).total_seconds()
+    
+    if span_seconds <= 2 * 3600:  # <= 2 hours
+        return "10min"
+    elif span_seconds <= 6 * 3600:  # <= 6 hours
+        return "15min"
+    elif span_seconds <= 24 * 3600:  # <= 24 hours
+        return "30min"
+    else:
+        return "1H"
+
+
+def _align_tick_start(start: pd.Timestamp, freq: str) -> pd.Timestamp:
+    """
+    Align tick start time to frequency boundary.
+    
+    Args:
+        start: Start timestamp
+        freq: Frequency string from _calculate_tick_frequency
+        
+    Returns:
+        Aligned timestamp
+    """
+    if freq.endswith("H"):
+        return start.floor("H")
+    else:
+        minutes = int(freq.replace("min", ""))
+        return start - pd.Timedelta(
+            minutes=(start.minute % minutes),
+            seconds=start.second,
+            microseconds=start.microsecond
+        )
+
+
+def _create_day_separators(days: pd.DatetimeIndex, start: pd.Timestamp, 
+                          end: pd.Timestamp) -> list:
+    """
+    Create vertical line shapes for day boundaries.
+    
+    Args:
+        days: Unique day timestamps (floored to midnight)
+        start: Plot start time
+        end: Plot end time
+        
+    Returns:
+        List of plotly shape dictionaries
+    """
+    shapes = []
+    for day in days:
+        day = pd.to_datetime(day)
+        if start <= day <= end:
+            shapes.append(dict(
+                type="line", x0=day, x1=day, xref="x", y0=0, y1=1, yref="paper",
+                line=dict(color=LIGHT_GRAY, width=1, dash="dash"), opacity=0.6
+            ))
+    return shapes
+
+
+def _create_date_annotations(datetimes: pd.Series, y_position: float = -0.16) -> list:
+    """
+    Create MM/DD date label annotations for first measurement of each day.
+    
+    Args:
+        datetimes: Series of datetime values
+        y_position: Vertical position relative to plot (paper coordinates)
+        
+    Returns:
+        List of plotly annotation dictionaries
+    """
+    first_per_day = datetimes.groupby(datetimes.dt.floor("D")).min().tolist()
+    
+    annotations = []
+    for first_time in first_per_day:
+        annotations.append(dict(
+            x=first_time, y=y_position, xref="x", yref="paper",
+            text=pd.to_datetime(first_time).strftime("%m/%d"), showarrow=False,
+            font=dict(size=DATE_LABEL_FONT_SIZE, family="Arial", color=DARK_GRAY)
+        ))
+    
+    return annotations
+
+
+# ========== PUBLIC API FUNCTIONS ==========
+
+def get_hourly_weather(start_date: str, end_date: str, icao_code: str = "KCAE"):
+    """
+    Fetch hourly and daily weather data from Open-Meteo Archive API.
+    
+    Retrieves temperature, humidity, and precipitation data for the specified date range
+    from the nearest airport weather station. Data is returned in America/New_York timezone.
+    
+    Args:
+        start_date: Start date in 'YYYY-MM-DD' format
+        end_date: End date in 'YYYY-MM-DD' format
+        icao_code: Four-letter ICAO airport code (default: "KCAE" for Columbia, SC)
+        
+    Returns:
+        Tuple of (hourly_df, daily_df, airport_name) where:
+        - hourly_df: DataFrame with columns ['date', 'temperature_2m', 'relative_humidity_2m', 'precipitation']
+        - daily_df: DataFrame with columns ['date', 'precipitation_sum', 'rolling_precipitation_sum']
+        - airport_name: Name of the weather station
+        
+    Raises:
+        RuntimeError: If required dependencies (openmeteo_requests, etc.) are not installed
+        ValueError: If ICAO code is invalid
+        
+    Notes:
+        - Fetches 7 days before start_date for rolling precipitation calculations
+        - Uses cached requests to minimize API calls
+        - Includes automatic retry logic for failed requests
+        - All timestamps are timezone-aware (America/New_York)
+    """
+    # Validate dependencies
     if not _HAS_OPENMETEO:
-        raise RuntimeError("openmeteo_requests and supporting packages are not available in the environment.")
+        raise RuntimeError(
+            "Required weather API dependencies not installed. "
+            "Install with: pip install openmeteo-requests requests-cache airportsdata retry-requests"
+        )
 
-    # find airport coords
-    def icao_to_coordinates(icao_code):
-        airports = airportsdata.load()
-        if icao_code in airports:
-            return airports[icao_code]['lat'], airports[icao_code]['lon']
-        return None, None
-
-    latitude, longitude = icao_to_coordinates(icao_code)
+    # Get airport coordinates
+    latitude, longitude = _icao_to_coordinates(icao_code)
     if latitude is None:
         raise ValueError(f"Invalid ICAO code: {icao_code}")
 
-    airport_name = airportsdata.load()[icao_code]["name"] if icao_code in airportsdata.load() else icao_code
+    airport_name = _get_airport_name(icao_code)
 
-    # Use cached session + retries like your uploaded script
-    cache_session = requests_cache.CachedSession('.cache', expire_after=-1)
-    retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
+    # Set up cached HTTP session with retry logic
+    cache_session = requests_cache.CachedSession(CACHE_DIR, expire_after=-1)
+    retry_session = retry(cache_session, retries=API_RETRY_COUNT, backoff_factor=API_RETRY_BACKOFF)
     openmeteo = openmeteo_requests.Client(session=retry_session)
 
-    url = "https://archive-api.open-meteo.com/v1/archive"
+    # Configure API request parameters
+    # Fetch 7 days before start for rolling precipitation calculations
     params = {
         "latitude": latitude,
         "longitude": longitude,
@@ -70,16 +253,16 @@ def get_hourly_weather(start_date, end_date, icao_code="KCAE"):
         "daily": ["precipitation_sum"],
         "temperature_unit": "fahrenheit",
         "precipitation_unit": "inch",
-        "timezone": "UTC"   # fetch in UTC then convert to America/New_York below
+        "timezone": "UTC"  # Fetch in UTC, convert to local timezone below
     }
 
-    # Request (matches previous file's approach)
-    responses = openmeteo.weather_api(url, params=params)
+    # Make API request
+    responses = openmeteo.weather_api(WEATHER_API_URL, params=params)
     response = responses[0]
     hourly = response.Hourly()
     daily = response.Daily()
 
-    # Build hourly dataframe (the uploaded script used Time(), TimeEnd(), Interval())
+    # Build hourly DataFrame
     hourly_index = pd.date_range(
         start=pd.to_datetime(hourly.Time(), unit="s", utc=True),
         end=pd.to_datetime(hourly.TimeEnd(), unit="s", utc=True),
@@ -93,6 +276,7 @@ def get_hourly_weather(start_date, end_date, icao_code="KCAE"):
         "precipitation": hourly.Variables(2).ValuesAsNumpy()
     })
 
+    # Build daily DataFrame
     daily_index = pd.date_range(
         start=pd.to_datetime(daily.Time(), unit="s", utc=True),
         end=pd.to_datetime(daily.TimeEnd(), unit="s", utc=True),
@@ -104,55 +288,83 @@ def get_hourly_weather(start_date, end_date, icao_code="KCAE"):
         "precipitation_sum": daily.Variables(0).ValuesAsNumpy()
     })
 
-    # rolling precipitation sum (example: 3-day rolling like in uploaded script)
-    daily_df["rolling_precipitation_sum"] = daily_df["precipitation_sum"].rolling(window=3, min_periods=1).sum()
+    # Calculate 3-day rolling precipitation sum
+    daily_df["rolling_precipitation_sum"] = (
+        daily_df["precipitation_sum"]
+        .rolling(window=3, min_periods=1)
+        .sum()
+    )
 
-    # Convert to America/New_York for display/merging
-    hourly_df["date"] = hourly_df["date"].dt.tz_convert("America/New_York")
-    daily_df["date"] = daily_df["date"].dt.tz_convert("America/New_York")
+    # Convert timestamps to local timezone
+    hourly_df["date"] = hourly_df["date"].dt.tz_convert(TIMEZONE)
+    daily_df["date"] = daily_df["date"].dt.tz_convert(TIMEZONE)
 
     return hourly_df, daily_df, airport_name
 
 
-def match_weather_to_resistance(res_df, hourly_df):
+def match_weather_to_resistance(res_df: pd.DataFrame, hourly_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Given res_df with a 'datetime' column and hourly_df with 'date' (tz-aware),
-    round each resistance datetime to nearest hour and return a DataFrame with:
-      - original datetime (res_datetime)
-      - matched_hour (rounded)
-      - temperature_2m, relative_humidity_2m, precipitation (for that hour)
-    Only hours that exist in hourly_df are returned; missing hours show NaN.
+    Match weather data to resistance measurement timestamps.
+    
+    For each resistance measurement datetime, finds the nearest hour in the weather data
+    and returns the temperature, humidity, and precipitation for that hour.
+    
+    Args:
+        res_df: DataFrame with 'datetime' column (resistance measurements)
+        hourly_df: DataFrame with 'date' column (hourly weather data)
+        
+    Returns:
+        DataFrame with columns:
+        - res_datetime: Original resistance measurement datetime
+        - matched_hour: Rounded hour matched to weather data
+        - temperature_2m: Temperature in °F
+        - relative_humidity_2m: Relative humidity percentage
+        - precipitation: Precipitation in inches
+        
+    Raises:
+        ValueError: If res_df doesn't contain 'datetime' column
+        
+    Notes:
+        - Rounds each resistance datetime to nearest hour for matching
+        - Handles timezone conversion automatically (assumes America/New_York)
+        - Returns NaN for weather values if no matching hour found
+        - Missing hours in weather data will show as NaN in output
     """
+    # Validate input
     if "datetime" not in res_df.columns:
         raise ValueError("res_df must contain a 'datetime' column")
 
-    # Ensure timezone alignment: convert res datetimes to America/New_York (same as hourly_df)
+    # Prepare resistance data
     res = res_df.copy()
     res["datetime"] = pd.to_datetime(res["datetime"])
-    # if naive, treat as local America/New_York
+    
+    # Ensure timezone alignment to America/New_York
     if res["datetime"].dt.tz is None:
-        res["datetime"] = res["datetime"].dt.tz_localize("America/New_York")
+        res["datetime"] = res["datetime"].dt.tz_localize(TIMEZONE)
     else:
-        res["datetime"] = res["datetime"].dt.tz_convert("America/New_York")
+        res["datetime"] = res["datetime"].dt.tz_convert(TIMEZONE)
 
-    # Round to nearest hour
+    # Round each datetime to nearest hour for matching
     res["rounded_hour"] = res["datetime"].dt.round("H")
 
-    # Prepare hourly_df index for fast lookup
+    # Prepare hourly weather data for lookup
     hourly = hourly_df.copy()
-    # ensure hourly 'date' tz-aware America/New_York
     hourly["date"] = pd.to_datetime(hourly["date"])
+    
+    # Ensure timezone alignment
     if hourly["date"].dt.tz is None:
-        hourly["date"] = hourly["date"].dt.tz_localize("America/New_York")
+        hourly["date"] = hourly["date"].dt.tz_localize(TIMEZONE)
     else:
-        hourly["date"] = hourly["date"].dt.tz_convert("America/New_York")
+        hourly["date"] = hourly["date"].dt.tz_convert(TIMEZONE)
+    
     hourly = hourly.set_index("date")
 
-    # For each rounded_hour, lookup in hourly
+    # Lookup function to find weather for each hour
     def lookup_hour(dt):
+        """Look up weather data for a specific datetime."""
         try:
             row = hourly.loc[dt]
-            # if multiple rows (unlikely), take first
+            # Handle multiple rows (unlikely but possible)
             if isinstance(row, pd.DataFrame):
                 row = row.iloc[0]
             return pd.Series({
@@ -161,237 +373,252 @@ def match_weather_to_resistance(res_df, hourly_df):
                 "precipitation": row["precipitation"]
             })
         except KeyError:
-            return pd.Series({"temperature_2m": np.nan, "relative_humidity_2m": np.nan, "precipitation": np.nan})
+            # Hour not found in weather data
+            return pd.Series({
+                "temperature_2m": np.nan,
+                "relative_humidity_2m": np.nan,
+                "precipitation": np.nan
+            })
 
+    # Match weather to each resistance measurement
     matched = res[["datetime", "rounded_hour"]].copy()
-    matched = pd.concat([matched, matched["rounded_hour"].apply(lookup_hour)], axis=1)
-    # Keep rounded_hour for plotting/labeling
-    matched = matched.rename(columns={"datetime": "res_datetime", "rounded_hour": "matched_hour"})
+    weather_cols = matched["rounded_hour"].apply(lookup_hour)
+    matched = pd.concat([matched, weather_cols], axis=1)
+    
+    # Rename columns for clarity
+    matched = matched.rename(columns={
+        "datetime": "res_datetime",
+        "rounded_hour": "matched_hour"
+    })
 
     return matched
 
 
-def create_weather_plot_png(matched_weather_df, daily_df, out_png, title="Weather (temp/humidity/rainfall)"):
+def create_weather_plot_png(matched_weather_df: pd.DataFrame, daily_df: pd.DataFrame, 
+                           out_png: str, title: str = "Weather (temp/humidity/rainfall)", 
+                           png_width: int = 1400, png_height: int = 500) -> bool:
     """
-    Improved weather plot that aligns x-axis ticks with the resistance plot and uses
-    matched_weather_df rows (which should include 'matched_hour' for each resistance sample).
-
-    - Temperature: red line, left axis
-    - Humidity: blue line, right axis
-    - Rainfall: thin bars, right axis
-    - X-axis ticks forced to HH:MM (same logic as resistance plot)
-    - Vertical day separators and MM/DD labels under first point per day
+    Generate weather plot PNG with Atlantic Electric branding.
+    
+    Creates a dual-axis plot showing temperature (°F) on left axis and humidity (%)/
+    precipitation (in) on right axis. Includes day separators and MM/DD date labels,
+    with styling matching the resistance plot.
+    
+    Args:
+        matched_weather_df: DataFrame from match_weather_to_resistance() with columns:
+                           ['res_datetime', 'matched_hour', 'temperature_2m', 
+                            'relative_humidity_2m', 'precipitation']
+        daily_df: DataFrame from get_hourly_weather() with daily precipitation data
+        out_png: Output file path for PNG image
+        title: Plot title (default: "Weather (temp/humidity/rainfall)")
+        png_width: Image width in pixels (default: 1400)
+        png_height: Image height in pixels (default: 500)
+        
+    Returns:
+        True if plot created successfully, False otherwise
+        
+    Notes:
+        - Uses Atlantic Electric brand colors
+        - Font sizes match resistance plot (24pt title, 18pt axes, 16pt ticks)
+        - Precipitation displayed as bars (hourly if available, otherwise daily)
+        - Automatic tick frequency based on time span
+        - MM/DD date labels positioned at y=-0.16
     """
-    import pandas as pd
-    import numpy as np
-    import plotly.graph_objects as go
-    from datetime import timedelta
-    from pathlib import Path
-
-    # defensive checks
+    # Validate input
     if matched_weather_df is None or matched_weather_df.empty:
-        print("No matched weather data to plot.")
+        print("⚠️  No matched weather data to plot.")
         return False
 
-    # copy and ensure datetimes
+    # Prepare data
     df = matched_weather_df.copy()
     df["matched_hour"] = pd.to_datetime(df["matched_hour"])
     df = df.sort_values("matched_hour").reset_index(drop=True)
-
-    # Extract series (coerce to numeric)
+    
     x = df["matched_hour"].tolist()
-    temp = pd.to_numeric(df.get("temperature_2m", pd.Series([np.nan]*len(df))), errors="coerce").tolist()
-    hum = pd.to_numeric(df.get("relative_humidity_2m", pd.Series([np.nan]*len(df))), errors="coerce").tolist()
-    # For rainfall at the matched times we prefer hourly precipitation if present in df,
-    # otherwise use daily_df (display as daily bars) — try hourly first:
+    temp = pd.to_numeric(
+        df.get("temperature_2m", pd.Series([np.nan] * len(df))), 
+        errors="coerce"
+    ).tolist()
+    hum = pd.to_numeric(
+        df.get("relative_humidity_2m", pd.Series([np.nan] * len(df))), 
+        errors="coerce"
+    ).tolist()
+    
+    # Determine rainfall data source (hourly vs daily)
     if "precipitation" in df.columns:
         rain_at_hours = pd.to_numeric(df["precipitation"], errors="coerce")
         use_hourly_rain = True
     else:
-        # fall back to daily totals (bars at midnight)
         use_hourly_rain = False
+        # Prepare daily data as fallback
         if daily_df is None or daily_df.empty:
             daily = pd.DataFrame(columns=["date", "rain"])
         else:
             daily = daily_df.copy()
             daily["date"] = pd.to_datetime(daily["date"])
+            # Use rolling precipitation if available, otherwise regular sum
             if "rolling_precipitation_sum" in daily.columns:
                 daily["rain"] = pd.to_numeric(daily["rolling_precipitation_sum"], errors="coerce")
             elif "precipitation_sum" in daily.columns:
                 daily["rain"] = pd.to_numeric(daily["precipitation_sum"], errors="coerce")
             else:
-                daily["rain"] = pd.to_numeric(daily.get("precipitation", pd.Series([np.nan]*len(daily))), errors="coerce")
+                daily["rain"] = pd.to_numeric(
+                    daily.get("precipitation", pd.Series([np.nan] * len(daily))), 
+                    errors="coerce"
+                )
 
-    # Colors & style
-    temp_color = "#A6192E"    # Atlantic red
-    hum_color = "#2A66D9"     # blue
-    rain_color = "#4C4EA3"    # darker blue/purple
-    light_gray = "#E6E6E6"
-    dark_gray = "#231F20"
-
-    # Determine tick frequency using same rules as resistance plot
+    # Calculate time range and tick parameters
     start = pd.to_datetime(df["matched_hour"].min())
     end = pd.to_datetime(df["matched_hour"].max())
-    span_seconds = (end - start).total_seconds()
-    if span_seconds <= 2 * 3600:
-        freq = "10min"
-    elif span_seconds <= 6 * 3600:
-        freq = "15min"
-    elif span_seconds <= 24 * 3600:
-        freq = "30min"
-    else:
-        freq = "1H"
-
-    tick_start = start
-    if freq.endswith("H"):
-        tick_start = tick_start.floor("H")
-    else:
-        minutes = int(freq.replace("min", ""))
-        tick_start = tick_start - pd.Timedelta(minutes=(tick_start.minute % minutes),
-                                               seconds=tick_start.second,
-                                               microseconds=tick_start.microsecond)
-
-    tick_vals = pd.date_range(start=tick_start, end=end + pd.Timedelta(minutes=1), freq=freq).to_pydatetime().tolist()
+    
+    freq = _calculate_tick_frequency(start, end)
+    tick_start = _align_tick_start(start, freq)
+    
+    tick_vals = pd.date_range(
+        start=tick_start, 
+        end=end + pd.Timedelta(minutes=1), 
+        freq=freq
+    ).to_pydatetime().tolist()
     tick_text = [t.strftime("%H:%M") for t in tick_vals]
 
-    # Day separators and first-per-day MM/DD labels
+    # Create visual elements
     days = pd.to_datetime(df["matched_hour"]).dt.floor("D").unique()
-    shapes = []
-    for d in days:
-        d = pd.to_datetime(d)
-        if d >= start and d <= end:
-            shapes.append(dict(
-                type="line", x0=d, x1=d, xref="x",
-                y0=0, y1=1, yref="paper",
-                line=dict(color=light_gray, width=1, dash="dash"),
-                opacity=0.6
-            ))
+    shapes = _create_day_separators(days, start, end)
+    annotations = _create_date_annotations(df["matched_hour"], y_position=-0.16)
 
-    # first measurement per day for label placement
-    first_per_day = df.groupby(df["matched_hour"].dt.floor("D"))["matched_hour"].min().tolist()
-    annotations = []
-    for f in first_per_day:
-        annotations.append(dict(
-            x=f, y=-0.15, xref="x", yref="paper",
-            text=pd.to_datetime(f).strftime("%m/%d"),
-            showarrow=False, font=dict(size=10, color=dark_gray)
-        ))
-
-    # Build figure
+    # ========== BUILD PLOT ==========
     fig = go.Figure()
 
-    # Temperature (left axis)
+    # Temperature trace (left y-axis)
     fig.add_trace(go.Scatter(
-        x=x, y=temp,
-        name="Temperature (°F)",
+        x=x, y=temp, 
+        name="Temperature (°F)", 
         mode="lines+markers",
-        line=dict(color=temp_color, width=2),
-        marker=dict(size=6),
+        line=dict(color=TEMP_COLOR, width=2.5),
+        marker=dict(size=7, color=TEMP_COLOR),
         yaxis="y1",
         hovertemplate="%{x|%b %d %H:%M}<br>Temp: %{y:.1f}°F<extra></extra>"
     ))
 
-    # Humidity (right axis)
+    # Humidity trace (right y-axis)
     fig.add_trace(go.Scatter(
-        x=x, y=hum,
-        name="Humidity (%)",
+        x=x, y=hum, 
+        name="Humidity (%)", 
         mode="lines+markers",
-        line=dict(color=hum_color, width=2),
-        marker=dict(size=6),
+        line=dict(color=HUM_COLOR, width=2.5),
+        marker=dict(size=7, color=HUM_COLOR),
         yaxis="y2",
         hovertemplate="%{x|%b %d %H:%M}<br>Humidity: %{y:.0f}%<extra></extra>"
     ))
 
-    # Rainfall: prefer hourly precipitation (thin bars), else daily bars
+    # Rainfall trace (right y-axis, bars)
     if use_hourly_rain:
-        # narrow bar width: use a fraction of tick spacing (in ms)
-        # compute approximate bar width as 60% of interval between ticks (or 10 minutes default)
+        # Calculate bar width based on tick frequency
         if len(tick_vals) >= 2:
-            interval_ms = (pd.to_datetime(tick_vals[1]) - pd.to_datetime(tick_vals[0])).total_seconds() * 1000
-            bar_width = max(1, interval_ms * 0.25)  # 25% of tick spacing
+            interval_ms = (
+                pd.to_datetime(tick_vals[1]) - pd.to_datetime(tick_vals[0])
+            ).total_seconds() * 1000
+            bar_width = max(1, interval_ms * 0.25)
         else:
-            bar_width = 15 * 60 * 1000  # 15 minutes in ms
+            bar_width = 15 * 60 * 1000  # 15 minutes default
+            
         fig.add_trace(go.Bar(
-            x=x,
-            y=rain_at_hours,
+            x=x, y=rain_at_hours, 
             name="Rainfall (in)",
-            marker=dict(color=rain_color, opacity=0.6),
-            yaxis="y2",
+            marker=dict(color=RAIN_COLOR, opacity=0.6),
+            yaxis="y2", 
             width=bar_width,
             hovertemplate="%{x|%b %d %H:%M}<br>Rain: %{y:.2f} in<extra></extra>"
         ))
     else:
+        # Use daily precipitation data
         if not daily.empty:
-            # thin daily bars
-            day_width = 24 * 3600 * 1000 * 0.6
+            day_width = 24 * 3600 * 1000 * 0.6  # 60% of a day width
             fig.add_trace(go.Bar(
-                x=daily["date"],
-                y=daily["rain"],
+                x=daily["date"], y=daily["rain"], 
                 name="Rainfall (in)",
-                marker=dict(color=rain_color, opacity=0.6),
-                yaxis="y2",
+                marker=dict(color=RAIN_COLOR, opacity=0.6),
+                yaxis="y2", 
                 width=day_width,
                 hovertemplate="%{x|%b %d}<br>Rain: %{y:.2f} in<extra></extra>"
             ))
 
-        # --- Layout (modern syntax, matches resistance plot) ---
+    # ========== CONFIGURE LAYOUT ==========
     fig.update_layout(
         template="plotly_white",
-        title=dict(text=title, x=0.01, xanchor="left",
-                   font=dict(size=16, color=dark_gray)),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02,
-                    xanchor="center", x=0.5),
-        margin=dict(l=60, r=80, t=70, b=100),
-        width=PNG_WIDTH if "PNG_WIDTH" in globals() else 1200,
-        height=360,
+        title=dict(
+            text=title,
+            x=0.01, xanchor="left",
+            font=dict(size=TITLE_FONT_SIZE, family="Arial", color=DARK_GRAY, weight="bold")
+        ),
+        legend=dict(
+            orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5,
+            font=dict(size=LEGEND_FONT_SIZE, family="Arial", color=DARK_GRAY)
+        ),
+        margin=dict(l=80, r=100, t=100, b=130),
+        width=png_width,
+        height=png_height,
         shapes=shapes,
         annotations=annotations,
-        xaxis=dict(
-            title="Datetime",
-            type="date",
-            tickmode="array",
-            tickvals=tick_vals,
-            ticktext=tick_text,
-            tickangle=0,
-            showgrid=True,
-            gridcolor=light_gray,
-            zeroline=False,
-            tickfont=dict(family="Arial", size=10, color=dark_gray),
-            title_font=dict(family="Arial", size=12, color=dark_gray)
+        font=dict(family="Arial", size=TICK_FONT_SIZE, color=DARK_GRAY)
+    )
+
+    # Configure X-axis
+    fig.update_xaxes(
+        type="date",
+        tickmode="array",
+        tickvals=tick_vals,
+        ticktext=tick_text,
+        tickangle=0,
+        showgrid=True,
+        gridcolor=LIGHT_GRAY,
+        gridwidth=1,
+        zeroline=False,
+        title=dict(
+            text="Datetime", 
+            font=dict(size=AXIS_LABEL_FONT_SIZE, family="Arial", color=DARK_GRAY)
         ),
-        yaxis=dict(
-            title=dict(text="Temperature (°F)",
-                       font=dict(family="Arial", size=12, color=temp_color)),
-            tickfont=dict(family="Arial", size=10, color=temp_color),
-            showgrid=True,
-            gridcolor=light_gray,
-            zeroline=False,
+        tickfont=dict(size=TICK_FONT_SIZE, family="Arial", color=DARK_GRAY),
+        range=[start - timedelta(minutes=1), end + timedelta(minutes=1)]
+    )
+
+    # Configure Y-axes
+    # Left axis: Temperature
+    fig.update_yaxes(
+        title=dict(
+            text="Temperature (°F)", 
+            font=dict(size=AXIS_LABEL_FONT_SIZE, family="Arial", color=TEMP_COLOR)
         ),
+        tickfont=dict(size=TICK_FONT_SIZE, family="Arial", color=TEMP_COLOR),
+        showgrid=True,
+        gridcolor=LIGHT_GRAY,
+        gridwidth=1,
+        zeroline=False
+    )
+
+    # Right axis: Humidity / Precipitation
+    fig.update_layout(
         yaxis2=dict(
-            title=dict(text="Humidity (%) / Rain (in)",
-                       font=dict(family="Arial", size=12, color=hum_color)),
-            tickfont=dict(family="Arial", size=10, color=hum_color),
+            title=dict(
+                text="Humidity (%) / Rain (in)", 
+                font=dict(size=AXIS_LABEL_FONT_SIZE, family="Arial", color=HUM_COLOR)
+            ),
+            tickfont=dict(size=TICK_FONT_SIZE, family="Arial", color=HUM_COLOR),
             overlaying="y",
             side="right",
             rangemode="tozero"
         )
     )
 
-
-    # pad x range slightly
-    if len(x) >= 1:
-        pad = timedelta(minutes=1)
-        fig.update_xaxes(range=[pd.to_datetime(x[0]) - pad, pd.to_datetime(x[-1]) + pad])
-
-    # write image
+    # ========== EXPORT PNG ==========
     try:
         out_path = Path(out_png)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        fig.write_image(str(out_path), width=PNG_WIDTH if "PNG_WIDTH" in globals() else 1200,
-                        height=360, scale=1)
-        print(f"Wrote weather PNG to: {out_path}")
+        fig.write_image(str(out_path), width=png_width, height=png_height, scale=1)
+        print(f"✅ Weather plot saved: {out_path}")
         return True
     except Exception as e:
-        print("Failed to write weather PNG:", e)
+        print(f"❌ Weather plot export failed: {e}")
+        print("   Install kaleido: pip install kaleido")
         return False
 
