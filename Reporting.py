@@ -1,38 +1,58 @@
-# reporting_generate_report_staticplot_header_improved.py
+"""
+Circuit Integrity Report Generator
+
+This script generates a comprehensive PDF report for circuit integrity testing,
+including resistance measurements over time and correlated weather data.
+
+Features:
+- Reads IR test CSV files and extracts resistance measurements
+- Creates high-quality resistance vs time plots
+- Integrates weather data from nearby airport stations
+- Generates a professional PDF report with plots and tabular data
+
+Author: Joseph Pauls
+"""
+
 from pathlib import Path
 import pandas as pd
 import re
 import sys
-import plotly.express as px
-from datetime import datetime
-import weather_data
-
-# Pillow for accurate logo sizing
+from datetime import datetime, timedelta
+import plotly.graph_objects as go
 from PIL import Image as PILImage
-
-# ReportLab imports
 from reportlab.lib.pagesizes import letter
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as RLImage, Table, TableStyle
+import weather_data
 
-# ---------- USER CONFIG ----------
+# ========== CONFIGURATION ==========
 INPUT_DIR = Path(r"C:\Users\pauls\OneDrive\Desktop\USC\Fall '25\QT Insite Automation\10_14_Test_750V\10_14_Test_750V\10_14_Test-2000")
 OUTPUT_DIR = INPUT_DIR / "Summary"
 OUTPUT_CSV = OUTPUT_DIR / "measurements_summary.csv"
 OUTPUT_PLOT_PNG = OUTPUT_DIR / "resistance_plot.png"
 OUTPUT_PDF = OUTPUT_DIR / "Circuit_Integrity_Report.pdf"
-LOGO_FILENAME = "AtlanticElectricLogo.png"  # expected in cwd
+LOGO_FILENAME = "AtlanticElectricLogo.png"
 COMPANY_NAME = "Atlantic Electric"
-FNAME_TS_RE = re.compile(r'(\d{8})_(\d{6})')
-# PNG size (pixels) for a high-quality static plot
+
+# Plot dimensions (pixels)
 PNG_WIDTH = 1400
 PNG_HEIGHT = 700
-# Max logo size in inches (keeps it small and proportional)
+WEATHER_HEIGHT = 500
+
+# Logo constraints (inches)
 MAX_LOGO_WIDTH_IN = 1.6
 MAX_LOGO_HEIGHT_IN = 1.0
-# ----------------------------------
+
+# Brand colors
+ATLANTIC_RED = "#A6192E"
+DARK_GRAY = "#231F20"
+LIGHT_GRAY = "#E6E6E6"
+
+# Filename pattern for extracting timestamps
+FNAME_TS_RE = re.compile(r'(\d{8})_(\d{6})')
+# ====================================
 
 def extract_datetime_from_filename(fname: str):
     m = FNAME_TS_RE.search(fname)
@@ -83,121 +103,187 @@ def collect_measurements():
     return result_df
 
 
-def create_static_plot_png(df: pd.DataFrame):
+def _calculate_tick_frequency(start: datetime, end: datetime) -> str:
     """
-    Static Plotly PNG:
-    - HH:MM tick labels (tickvals/ticktext)
-    - dashed vertical line at each midnight
-    - small MM/DD label under the FIRST measurement of each day
-    - Atlantic Electric color theme
+    Determine appropriate tick frequency based on time span.
+    
+    Args:
+        start: Start datetime
+        end: End datetime
+        
+    Returns:
+        Frequency string ('10min', '15min', '30min', or '1H')
     """
-    import plotly.graph_objects as go
-    import pandas as pd
-    from datetime import timedelta
+    span_hours = (end - start).total_seconds() / 3600
+    
+    if span_hours <= 2:
+        return "10min"
+    elif span_hours <= 6:
+        return "15min"
+    elif span_hours <= 24:
+        return "30min"
+    else:
+        return "1H"
 
+
+def _align_tick_start(start: datetime, freq: str) -> datetime:
+    """
+    Align tick start time to frequency boundary.
+    
+    Args:
+        start: Start datetime
+        freq: Frequency string
+        
+    Returns:
+        Aligned datetime
+    """
+    tick_start = pd.to_datetime(start)
+    
+    if freq.endswith("H"):
+        return tick_start.floor("H")
+    else:
+        minutes = int(freq.replace("min", ""))
+        return tick_start - pd.Timedelta(
+            minutes=(tick_start.minute % minutes),
+            seconds=tick_start.second,
+            microseconds=tick_start.microsecond
+        )
+
+
+def _create_day_separators(days: pd.DatetimeIndex, start: datetime, end: datetime) -> list:
+    """
+    Create vertical line shapes for day boundaries.
+    
+    Args:
+        days: Unique day timestamps
+        start: Plot start time
+        end: Plot end time
+        
+    Returns:
+        List of plotly shape dictionaries
+    """
+    shapes = []
+    for day in days:
+        day = pd.to_datetime(day)
+        if start <= day <= end:
+            shapes.append(dict(
+                type="line", x0=day, x1=day, xref="x", y0=0, y1=1, yref="paper",
+                line=dict(color=LIGHT_GRAY, width=1, dash="dash"), opacity=0.6
+            ))
+    return shapes
+
+
+def _create_date_annotations(datetimes: pd.Series, start: datetime, end: datetime, 
+                            y_position: float = -0.1) -> list:
+    """
+    Create MM/DD date label annotations for first measurement of each day.
+    
+    Args:
+        datetimes: Series of datetime values
+        start: Plot start time
+        end: Plot end time
+        y_position: Vertical position relative to plot (paper coordinates)
+        
+    Returns:
+        List of plotly annotation dictionaries
+    """
+    first_per_day = (
+        datetimes.dt.floor("D")
+        .drop_duplicates()
+        .reset_index(drop=True)
+    )
+    
+    # Map each day to its first occurrence in the original series
+    first_times = datetimes.groupby(datetimes.dt.floor("D")).min()
+    
+    annotations = []
+    for day in first_per_day:
+        first_time = first_times.loc[day]
+        if start <= first_time <= end:
+            annotations.append(dict(
+                x=first_time, y=y_position, xref="x", yref="paper",
+                text=first_time.strftime("%m/%d"), showarrow=False,
+                font=dict(size=16, family="Arial", color=DARK_GRAY)
+            ))
+    
+    return annotations
+
+
+def create_static_plot_png(df: pd.DataFrame) -> bool:
+    """
+    Generate resistance vs time plot as static PNG with Atlantic Electric branding.
+    
+    Creates a high-quality plotly chart showing resistance measurements over time,
+    with time-of-day labels on the x-axis and MM/DD date markers below. Includes
+    day separator lines and automatic tick frequency adjustment based on time span.
+    
+    Args:
+        df: DataFrame with 'datetime' and 'resistance' columns
+        
+    Returns:
+        True if plot created successfully, False otherwise
+    """
     if df.empty:
-        print("No data to plot.")
+        print("⚠️  No data to plot.")
         return False
-
-    # brand colors
-    red = "#A6192E"
-    dark_gray = "#231F20"
-    light_gray = "#E6E6E6"
-
-    # ensure proper datetimes and sorting
+    
+    # Prepare data
     df = df.copy()
     df["datetime"] = pd.to_datetime(df["datetime"])
     df = df.sort_values("datetime").reset_index(drop=True)
-
+    
     x = df["datetime"].tolist()
     y = df["resistance"].tolist()
-
-    start = df["datetime"].min()
-    end = df["datetime"].max()
-
-    # choose tick frequency based on span
-    span_seconds = (end - start).total_seconds()
-    if span_seconds <= 2 * 3600:
-        freq = "10min"
-    elif span_seconds <= 6 * 3600:
-        freq = "15min"
-    elif span_seconds <= 24 * 3600:
-        freq = "30min"
-    else:
-        freq = "1H"
-
-    # align tick_start to freq boundary
-    tick_start = pd.to_datetime(start)
-    if freq.endswith("H"):
-        tick_start = tick_start.floor("H")
-    else:
-        minutes = int(freq.replace("min", ""))
-        tick_start = tick_start - pd.Timedelta(minutes=(tick_start.minute % minutes),
-                                               seconds=tick_start.second,
-                                               microseconds=tick_start.microsecond)
-
-    tick_vals = pd.date_range(start=tick_start, end=end + pd.Timedelta(minutes=1), freq=freq).to_pydatetime().tolist()
+    start, end = df["datetime"].min(), df["datetime"].max()
+    
+    # Calculate time axis parameters
+    freq = _calculate_tick_frequency(start, end)
+    tick_start = _align_tick_start(start, freq)
+    tick_vals = pd.date_range(
+        start=tick_start, 
+        end=end + pd.Timedelta(minutes=1), 
+        freq=freq
+    ).to_pydatetime().tolist()
     tick_text = [t.strftime("%H:%M") for t in tick_vals]
-
-    # day boundaries (midnight) shapes
+    
+    # Create visual elements
     days = pd.to_datetime(df["datetime"]).dt.floor("D").unique()
-    shapes = []
-    for d in days:
-        d = pd.to_datetime(d)
-        if d >= start and d <= end:
-            shapes.append(dict(
-                type="line", x0=d, x1=d, xref="x",
-                y0=0, y1=1, yref="paper",
-                line=dict(color=light_gray, width=1, dash="dash"),
-                opacity=0.6
-            ))
-
-    # Determine the first measurement datetime for each day (to place MM/DD labels)
-    first_per_day = (
-        df.groupby(df["datetime"].dt.floor("D"), sort=True)["datetime"]
-          .min()
-          .dt.to_pydatetime()
-          .tolist()
-    )
-
-    # Build annotations: small MM/DD under first occurrence of each day
-    annotations = []
-    for dt in first_per_day:
-        if dt >= start and dt <= end:
-            annotations.append(dict(
-                x=dt,
-                y=-0.12,
-                xref="x",
-                yref="paper",
-                text=dt.strftime("%m/%d"),
-                showarrow=False,
-                font=dict(size=12, color="black")
-            ))
-
-    # Main figure
+    shapes = _create_day_separators(days, start, end)
+    annotations = _create_date_annotations(df["datetime"], start, end, y_position=-0.1)
+    
+    # Build plot
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        x=x,
-        y=y,
-        mode="lines+markers",
-        line=dict(width=2, color=red),
-        marker=dict(size=6, color=red),
+        x=x, y=y, 
+        mode="lines+markers", 
+        name="Resistance",
+        line=dict(width=2.5, color=ATLANTIC_RED),
+        marker=dict(size=7, color=ATLANTIC_RED),
         hovertemplate="%{x|%Y-%m-%d %H:%M:%S}<br>Resistance: %{y:,.2f} Ω<extra></extra>"
     ))
-
+    
+    # Configure layout
     fig.update_layout(
         template="plotly_white",
-        title="Resistance Measurements Over Time",
-        title_font=dict(size=18, family="Arial", color=dark_gray),
-        font=dict(family="Arial", size=12, color=dark_gray),
-        margin=dict(l=60, r=30, t=80, b=110),
+        title=dict(
+            text="Resistance Measurements Over Time",
+            x=0.01, xanchor="left",
+            font=dict(size=24, family="Arial", color=DARK_GRAY, weight="bold")
+        ),
+        legend=dict(
+            orientation="h", yanchor="bottom", y=1.02, 
+            xanchor="center", x=0.5,
+            font=dict(size=16, family="Arial", color=DARK_GRAY)
+        ),
+        margin=dict(l=80, r=50, t=100, b=130),
         width=PNG_WIDTH,
         height=PNG_HEIGHT,
         shapes=shapes,
-        annotations=annotations
+        annotations=annotations,
+        font=dict(family="Arial", size=16, color=DARK_GRAY)
     )
-
-    # Force HH:MM labels via explicit tickvals/ticktext
+    
+    # Configure axes
     fig.update_xaxes(
         type="date",
         tickmode="array",
@@ -205,162 +291,230 @@ def create_static_plot_png(df: pd.DataFrame):
         ticktext=tick_text,
         tickangle=0,
         showgrid=True,
-        gridcolor=light_gray,
-        title="Datetime"
+        gridcolor=LIGHT_GRAY,
+        gridwidth=1,
+        zeroline=False,
+        title=dict(text="Datetime", font=dict(size=18, family="Arial", color=DARK_GRAY)),
+        tickfont=dict(size=16, family="Arial", color=DARK_GRAY),
+        range=[start - timedelta(minutes=1), end + timedelta(minutes=1)]
     )
-
+    
     fig.update_yaxes(
-        title="Resistance (Ohms)",
+        title=dict(text="Resistance (Ohms)", font=dict(size=18, family="Arial", color=DARK_GRAY)),
+        tickfont=dict(size=16, family="Arial", color=DARK_GRAY),
         showgrid=True,
-        gridcolor=light_gray,
+        gridcolor=LIGHT_GRAY,
+        gridwidth=1,
+        zeroline=False,
         tickformat="~s"
     )
-
-    # small left/right padding
-    fig.update_xaxes(range=[start - timedelta(minutes=1), end + timedelta(minutes=1)])
-
-    # Export static PNG (requires kaleido)
+    
+    # Export to PNG
     try:
         fig.write_image(str(OUTPUT_PLOT_PNG), width=PNG_WIDTH, height=PNG_HEIGHT, scale=1)
-        print(f"Wrote static PNG plot to: {OUTPUT_PLOT_PNG}")
+        print(f"✅ Resistance plot saved: {OUTPUT_PLOT_PNG}")
         return True
     except Exception as e:
-        print("ERROR: Plotly static PNG export failed. Install kaleido: pip install kaleido")
-        print("Plot export error:", e)
+        print(f"❌ Plot export failed: {e}")
+        print("   Install kaleido: pip install kaleido")
         return False
 
 def integrate_weather(df: pd.DataFrame, output_dir: Path, icao: str = "KCAE") -> Path | None:
     """
-    Fetch hourly weather for the date range in df, match to resistance datetimes
-    (nearest hour), create a weather PNG at output_dir/"weather_plot.png", and
-    return the Path on success or None on failure.
-    Requires weather_data.py with:
-      get_hourly_weather(start_date, end_date, icao_code)
-      match_weather_to_resistance(res_df, hourly_df)
-      create_weather_plot_png(matched_weather_df, daily_df, out_png)
+    Fetch weather data and create weather plot for the measurement time range.
+    
+    Retrieves hourly weather data from OpenMeteo API for the nearest airport station,
+    matches it to resistance measurement timestamps, and generates a weather plot
+    PNG showing temperature and precipitation over time.
+    
+    Args:
+        df: DataFrame with 'datetime' column defining the time range
+        output_dir: Directory where weather_plot.png will be saved
+        icao: ICAO airport code for weather station (default: "KCAE" for Columbia, SC)
+        
+    Returns:
+        Path to the created weather plot PNG, or None if generation failed
+        
+    Dependencies:
+        Requires weather_data.py module with:
+        - get_hourly_weather(start_date, end_date, icao_code)
+        - match_weather_to_resistance(res_df, hourly_df)
+        - create_weather_plot_png(matched_df, daily_df, out_png, png_width, png_height)
     """
-    from pathlib import Path
-    import pandas as pd
-    import weather_data
-
     try:
+        # Validate input data
         if df is None or df.empty:
             print("No resistance measurements; skipping weather integration.")
             return None
 
+        # Ensure output directory exists
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         weather_png = output_dir / "weather_plot.png"
 
-        # derive date range from df datetimes (use local dates)
+        # Extract date range from measurement datetimes
         start_dt = pd.to_datetime(df["datetime"].min())
         end_dt = pd.to_datetime(df["datetime"].max())
+        
         if pd.isna(start_dt) or pd.isna(end_dt):
             print("Could not determine start/end dates from measurements; skipping weather.")
             return None
 
-        start = start_dt.date().strftime("%Y-%m-%d")
-        end = end_dt.date().strftime("%Y-%m-%d")
+        start_date = start_dt.date().strftime("%Y-%m-%d")
+        end_date = end_dt.date().strftime("%Y-%m-%d")
 
-        print(f"Fetching weather for {start} -> {end} at ICAO {icao} ...")
+        # Fetch hourly weather data from API
+        print(f"Fetching weather for {start_date} → {end_date} at ICAO {icao}...")
         try:
-            # Some versions expect named param icao_code, some expect positional
-            hourly_df, daily_df, airport_name = weather_data.get_hourly_weather(start, end, icao_code=icao)
+            # Try named parameter first (newer API)
+            hourly_df, daily_df, airport_name = weather_data.get_hourly_weather(
+                start_date, end_date, icao_code=icao
+            )
         except TypeError:
-            hourly_df, daily_df, airport_name = weather_data.get_hourly_weather(start, end, icao)
+            # Fall back to positional argument (older API)
+            hourly_df, daily_df, airport_name = weather_data.get_hourly_weather(
+                start_date, end_date, icao
+            )
 
+        # Validate weather data retrieved
         if hourly_df is None or hourly_df.empty:
             print("Hourly weather fetch returned no data; skipping weather plot.")
             return None
 
+        # Match weather timestamps to resistance measurement timestamps
         matched = weather_data.match_weather_to_resistance(df, hourly_df)
         if matched is None or matched.empty:
             print("No matched weather rows for resistance datetimes; skipping weather plot.")
             return None
 
-        created = weather_data.create_weather_plot_png(matched, daily_df, str(weather_png))
+        # Generate weather plot PNG
+        created = weather_data.create_weather_plot_png(
+            matched, daily_df, str(weather_png), 
+            png_width=PNG_WIDTH, png_height=WEATHER_HEIGHT
+        )
+        
         if created:
-            print(f"Weather plot created at: {weather_png}")
+            print(f"✅ Weather plot created: {weather_png}")
             return weather_png
         else:
-            print("Weather plot creation failed.")
+            print("❌ Weather plot creation failed.")
             return None
 
     except Exception as exc:
-        print("Weather integration failed:", exc)
+        print(f"❌ Weather integration failed: {exc}")
         return None
 
 
 def _build_logo_rlimage(logo_path: Path):
     """
-    Load logo with Pillow, compute scaled drawWidth/drawHeight in points (ReportLab),
-    and return an RL Image object sized to fit within MAX_LOGO_*_IN while preserving aspect.
+    Load and size logo image for PDF embedding.
+    
+    Loads logo using Pillow, calculates scaled dimensions to fit within maximum
+    logo size constraints while preserving aspect ratio, and returns a ReportLab
+    Image object ready for PDF insertion.
+    
+    Args:
+        logo_path: Path to logo image file
+        
+    Returns:
+        ReportLab Image object with proper sizing, or None if loading fails
+        
+    Notes:
+        - Respects MAX_LOGO_WIDTH_IN and MAX_LOGO_HEIGHT_IN constants
+        - Preserves aspect ratio
+        - Will not upscale images smaller than max constraints
+        - Defaults to 72 DPI if image has no DPI metadata
     """
     if not logo_path.exists():
         return None
 
     try:
-        pil = PILImage.open(str(logo_path))
+        pil_img = PILImage.open(str(logo_path))
     except Exception as e:
-        print("Warning: Pillow cannot open logo:", e)
+        print(f"⚠️  Pillow cannot open logo: {e}")
         return None
 
-    # pixel dimensions
-    w_px, h_px = pil.size
-    # attempt to get DPI; default to 72 if not present
-    dpi_x, dpi_y = pil.info.get("dpi", (72, 72))
+    # Get pixel dimensions
+    width_px, height_px = pil_img.size
+    
+    # Extract DPI from image metadata, default to 72 if not present
+    dpi_x, dpi_y = pil_img.info.get("dpi", (72, 72))
     if dpi_x == 0:
         dpi_x = 72
     if dpi_y == 0:
         dpi_y = 72
 
-    # convert to inches
-    w_in = w_px / dpi_x
-    h_in = h_px / dpi_y
+    # Convert pixels to inches
+    width_in = width_px / dpi_x
+    height_in = height_px / dpi_y
 
-    # scale to fit in max footprint while preserving aspect ratio
-    scale = min(MAX_LOGO_WIDTH_IN / w_in, MAX_LOGO_HEIGHT_IN / h_in, 1.0)  # don't upscale
-    draw_w_pts = (w_in * scale) * inch
-    draw_h_pts = (h_in * scale) * inch
+    # Scale to fit within max footprint while preserving aspect ratio
+    # (Don't upscale if image is already smaller than constraints)
+    scale = min(MAX_LOGO_WIDTH_IN / width_in, MAX_LOGO_HEIGHT_IN / height_in, 1.0)
+    draw_width_pts = (width_in * scale) * inch
+    draw_height_pts = (height_in * scale) * inch
 
+    # Create ReportLab Image object with calculated dimensions
     try:
         rl_img = RLImage(str(logo_path))
-        rl_img.drawWidth = draw_w_pts
-        rl_img.drawHeight = draw_h_pts
+        rl_img.drawWidth = draw_width_pts
+        rl_img.drawHeight = draw_height_pts
         return rl_img
     except Exception as e:
-        print("Warning: ReportLab failed to create RL Image:", e)
+        print(f"⚠️  ReportLab failed to create Image: {e}")
         return None
 
 def build_pdf_report(df: pd.DataFrame, png_available: bool):
     """
-    Build PDF report using Atlantic Electric red theme.
-    - Red header for table (#A6192E)
-    - 'N/A' for missing values
-    - Formats resistance into kΩ, MΩ, or GΩ
+    Generate professional PDF report with Atlantic Electric branding.
+    
+    Creates a comprehensive PDF report including:
+    - Company logo and report header
+    - Resistance vs time plot (if available)
+    - Weather plot (if available)
+    - Tabular data with formatted resistance values
+    
+    Args:
+        df: DataFrame with 'datetime' and 'resistance' columns
+        png_available: Whether resistance plot PNG was successfully created
+        
+    Notes:
+        - Uses Atlantic Electric brand colors (red #A6192E, dark gray #231F20)
+        - Formats resistance values as kΩ, MΩ, or GΩ for readability
+        - Displays 'N/A' for missing values
+        - Embeds both resistance and weather plots if available
+        - Saves PDF to OUTPUT_PDF path
     """
-    from reportlab.lib import colors
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as RLImage, Table, TableStyle
-
-    doc = SimpleDocTemplate(str(OUTPUT_PDF), pagesize=letter,
-                            rightMargin=40, leftMargin=40,
-                            topMargin=40, bottomMargin=40)
+    # Initialize PDF document
+    doc = SimpleDocTemplate(
+        str(OUTPUT_PDF), 
+        pagesize=letter,
+        rightMargin=40, leftMargin=40,
+        topMargin=40, bottomMargin=40
+    )
     styles = getSampleStyleSheet()
     story = []
 
-    # Header: logo left, title text right (aligned top-right)
+    # ========== HEADER SECTION ==========
+    # Create logo element (left side)
     logo_path = Path.cwd() / LOGO_FILENAME
     logo_rl = _build_logo_rlimage(logo_path)
     left_cell = logo_rl if logo_rl else Paragraph("", styles["Normal"])
 
-    title_style = ParagraphStyle("TitleStyle", parent=styles["Heading1"],
-                                 fontName="Helvetica-Bold", fontSize=18,
-                                 leading=20, alignment=2)
-    subtitle_style = ParagraphStyle("Subtitle", parent=styles["Normal"],
-                                    fontSize=11, leading=14, alignment=2)
-    small_grey = ParagraphStyle("SmallGrey", parent=styles["Normal"],
-                                fontSize=9, textColor=colors.grey, alignment=2)
+    # Create title text elements (right side, top-aligned)
+    title_style = ParagraphStyle(
+        "TitleStyle", parent=styles["Heading1"],
+        fontName="Helvetica-Bold", fontSize=18,
+        leading=20, alignment=2  # alignment=2 is right-aligned
+    )
+    subtitle_style = ParagraphStyle(
+        "Subtitle", parent=styles["Normal"],
+        fontSize=11, leading=14, alignment=2
+    )
+    small_grey = ParagraphStyle(
+        "SmallGrey", parent=styles["Normal"],
+        fontSize=9, textColor=colors.grey, alignment=2
+    )
 
     gen_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     right_cell = [
@@ -369,8 +523,11 @@ def build_pdf_report(df: pd.DataFrame, png_available: bool):
         Paragraph(f"Report generated: {gen_time}", small_grey)
     ]
 
-    header_table = Table([[left_cell, right_cell]],
-                         colWidths=[1.6 * inch, 5.9 * inch])
+    # Assemble header table
+    header_table = Table(
+        [[left_cell, right_cell]],
+        colWidths=[1.6 * inch, 5.9 * inch]
+    )
     header_table.setStyle(TableStyle([
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ("LEFTPADDING", (0, 0), (-1, -1), 0),
@@ -379,43 +536,56 @@ def build_pdf_report(df: pd.DataFrame, png_available: bool):
     story.append(header_table)
     story.append(Spacer(1, 12))
 
-        # Plot image (resistance)
+    # ========== RESISTANCE PLOT ==========
     if png_available and OUTPUT_PLOT_PNG.exists():
         try:
-            img = RLImage(str(OUTPUT_PLOT_PNG),
-                          width=6.9 * inch, height=3.6 * inch)
-            story.append(img)
+            resistance_img = RLImage(
+                str(OUTPUT_PLOT_PNG),
+                width=6.9 * inch, 
+                height=3.6 * inch
+            )
+            story.append(resistance_img)
             story.append(Spacer(1, 12))
         except Exception as e:
-            print("Warning: failed to embed PNG plot:", e)
-            story.append(Paragraph("Plot preview not available.",
-                                   styles["Normal"]))
+            print(f"⚠️  Failed to embed resistance plot: {e}")
+            story.append(Paragraph(
+                "Resistance plot preview not available.",
+                styles["Normal"]
+            ))
             story.append(Spacer(1, 8))
     else:
         story.append(Paragraph(
-            "Plot preview not available. Install kaleido and re-run to embed it.",
-            styles["Normal"]))
+            "Resistance plot preview not available. Install kaleido and re-run to embed it.",
+            styles["Normal"]
+        ))
         story.append(Spacer(1, 8))
 
-    # --- Weather plot (embedded under resistance plot, if it exists) ---
+    # ========== WEATHER PLOT ==========
     weather_png_path = OUTPUT_DIR / "weather_plot.png"
     if weather_png_path.exists():
         try:
-            weather_img = RLImage(str(weather_png_path), width=6.9 * inch, height=2.6 * inch)
+            # Weather plot: 1400x500px embedded at 6.9"x2.5" to match aspect ratio
+            weather_img = RLImage(
+                str(weather_png_path), 
+                width=6.9 * inch, 
+                height=2.5 * inch
+            )
             story.append(weather_img)
             story.append(Spacer(1, 12))
         except Exception as e:
-            print("Warning: failed to embed weather PNG:", e)
-            # continue on to table
+            print(f"⚠️  Failed to embed weather plot: {e}")
 
-
-    # ---- Table ----
-    table_data = [["Date", "Resistance"]]
+    # ========== DATA TABLE ==========
+    # Build table data with formatted resistance values
+    table_data = [["Date", "Resistance"]]  # Header row
+    
     for _, row in df.iterrows():
+        # Format datetime
         dt = row["datetime"]
         dt_str = dt.strftime("%Y-%m-%d %H:%M:%S") if pd.notna(dt) else ""
+        
+        # Format resistance with appropriate units
         res = row["resistance"]
-
         if pd.isna(res):
             res_str = "N/A"
         else:
@@ -434,53 +604,93 @@ def build_pdf_report(df: pd.DataFrame, png_available: bool):
 
         table_data.append([dt_str, res_str])
 
-    # Atlantic Electric colors
-    ATLANTIC_RED = colors.HexColor("#A6192E")
-    DARK_GRAY = colors.HexColor("#231F20")
-
-    table = Table(table_data, colWidths=[3.5 * inch, 3.5 * inch], repeatRows=1)
+    # Create and style table with Atlantic Electric branding
+    table = Table(
+        table_data, 
+        colWidths=[3.5 * inch, 3.5 * inch], 
+        repeatRows=1  # Repeat header on page breaks
+    )
+    
+    atlantic_red = colors.HexColor("#A6192E")
+    dark_gray = colors.HexColor("#231F20")
+    
     table_style = TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), ATLANTIC_RED),
+        # Header row styling
+        ("BACKGROUND", (0, 0), (-1, 0), atlantic_red),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
         ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTSIZE", (0, 0), (-1, -1), 9),
-        ("ALIGN", (0, 0), (-1, -1), "LEFT"),
-        ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
         ("BOTTOMPADDING", (0, 0), (-1, 0), 6),
-        ("TEXTCOLOR", (0, 1), (-1, -1), DARK_GRAY),
+        
+        # Data rows styling
         ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("TEXTCOLOR", (0, 1), (-1, -1), dark_gray),
+        ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+        
+        # Grid
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
     ])
     table.setStyle(table_style)
     story.append(table)
     story.append(Spacer(1, 12))
 
-    note_style = ParagraphStyle("note", parent=styles["Normal"],
-                                fontSize=9, textColor=colors.grey)
-    story.append(Paragraph(
-        "Notes: 'Final Measurement' values converted to appropriate scale (Ω, kΩ, MΩ, or GΩ). "
-        "'N/A' indicates missing or invalid data.", note_style))
-
+    # ========== BUILD PDF ==========
     try:
         doc.build(story)
         print(f"✅ PDF report created: {OUTPUT_PDF}")
     except Exception as e:
-        print("ERROR creating PDF:", e)
+        print(f"❌ PDF creation failed: {e}")
 
 
 
 
 def main():
+    """
+    Main execution function for Circuit Integrity Report Generator.
+    
+    Orchestrates the complete report generation workflow:
+    1. Collect resistance measurements from CSV files
+    2. Generate resistance vs time plot
+    3. Fetch and integrate weather data
+    4. Build comprehensive PDF report
+    
+    Output files created in OUTPUT_DIR:
+    - measurements_summary.csv: Raw measurement data
+    - resistance_plot.png: Resistance over time visualization
+    - weather_plot.png: Weather conditions over time (if successful)
+    - Circuit_Integrity_Report.pdf: Complete professional report
+    """
+    print("=" * 60)
+    print("Circuit Integrity Report Generator")
+    print("=" * 60)
+    
+    # Step 1: Collect measurements from CSV files
+    print("\n[1/4] Collecting measurements from CSV files...")
     df = collect_measurements()
+    
+    # Step 2: Generate resistance plot
+    print("\n[2/4] Generating resistance plot...")
     png_ok = create_static_plot_png(df)
-
-    # integrate weather (creates OUTPUT_DIR/weather_plot.png if successful)
+    
+    # Step 3: Integrate weather data
+    print("\n[3/4] Integrating weather data...")
     try:
         weather_png = integrate_weather(df, OUTPUT_DIR, icao="KCAE")
+        if weather_png:
+            print(f"     Weather data successfully integrated")
+        else:
+            print(f"     Weather integration skipped (no data available)")
     except Exception as e:
-        print("Weather integration threw an exception:", e)
+        print(f"⚠️   Weather integration error: {e}")
         weather_png = None
-
+    
+    # Step 4: Build PDF report
+    print("\n[4/4] Building PDF report...")
     build_pdf_report(df, png_ok)
+    
+    print("\n" + "=" * 60)
+    print("Report generation complete!")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
