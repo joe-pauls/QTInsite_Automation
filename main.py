@@ -21,14 +21,9 @@ Dependencies:
 Author: Joseph Pauls
 
 TODO
-- Implement dynamic output folder creation based on timestamp
-- Modify Reporting.py to accept output folder parameter as an argument
-- Make sure weather_data.py works correctly with new folder structure and weather data values are saved to csv
 - Add checks for whether QT Insite is already running before launching or user is already logged in
-- Add options for user to input test voltage level, grounded/ungrounded checkbox, minimum resistance, and input those values into a testing sequence using gui automation
-- Add option to run a single test immediately to see results without scheduling
-- Add IEEE temperature normalization to 40C in report generation as a separate plot
-- Add weather data to the resistance table in the report
+- Add options for user to input test voltage level, grounded/ungrounded checkbox, minimum resistance, and integrate those values into the automation sequence
+- Add option to run a single test immediately to see results without scheduling (with its own configuration panel)
 
 """
 
@@ -36,6 +31,7 @@ import sys
 import time
 import subprocess
 import traceback
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -262,7 +258,7 @@ class AutomationWorker(QtCore.QThread):
     report_signal = QtCore.pyqtSignal(str)
 
     def __init__(self, total_s: int, interval_s: int, generate_report: bool = True, 
-                 parent=None):
+                 output_dir: Optional[Path] = None, parent=None):
         """
         Initialize automation worker.
         
@@ -270,12 +266,14 @@ class AutomationWorker(QtCore.QThread):
             total_s: Total duration to run tests (seconds)
             interval_s: Time between test runs (seconds)
             generate_report: Whether to generate PDF report at completion
+            output_dir: Directory where report artifacts should be written
             parent: Parent QObject
         """
         super().__init__(parent)
         self.total_s = int(total_s)
         self.interval_s = max(1, int(interval_s))
         self.generate_report = generate_report
+        self.output_dir = Path(output_dir) if output_dir else None
         self.stop_flag = False
 
     def log(self, m: str):
@@ -312,22 +310,22 @@ class AutomationWorker(QtCore.QThread):
                 self.finished_signal.emit(False)
                 return
             
-            # Step 3: Login
+            # Step 4: Login
             self.log("Logging in...")
             login_coords()
             
-            # Step 4: Verify connection
+            # Step 5: Verify connection
             self.log("Verifying connection...")
             verify_connection_coords()
             
-            # Step 5: Calculate number of test runs
+            # Step 6: Calculate number of test runs
             runs = max(1, self.total_s // self.interval_s)
             self.log(f"Starting {runs} test runs (interval: {self.interval_s}s)")
             
-            # Step 6: Execute scheduled tests
+            # Step 7: Execute scheduled tests
             for i in range(1, runs + 1):
                 if self.stop_flag:
-                    self.log("⚠️  Stopped by user")
+                    self.log("⚠️  Stopped by user request")
                     self.finished_signal.emit(False)
                     return
                 
@@ -338,26 +336,33 @@ class AutomationWorker(QtCore.QThread):
                 elapsed = 0.0
                 while elapsed < self.interval_s:
                     if self.stop_flag:
-                        self.log("⚠️  Stopped by user")
+                        self.log("⚠️  Stopped by user request")
                         self.finished_signal.emit(False)
                         return
                     time.sleep(0.5)
                     elapsed += 0.5
             
-            # Step 7: Generate report if enabled
+            # Step 8: Generate report if enabled
             if self.generate_report:
-                self.log("📊 Generating report...")
-                self.report_signal.emit("Generating report, please wait...")
-                try:
-                    Reporting.main()
-                    self.report_signal.emit("✅ Report generated successfully!")
-                    self.log("✅ Report generated successfully")
-                except Exception as e:
-                    error_msg = f"Report generation failed: {str(e)}"
-                    self.report_signal.emit(f"❌ {error_msg}")
-                    self.log(f"❌ {error_msg}")
+                if not self.output_dir:
+                    self.log("⚠️  No output directory configured; skipping report generation")
+                else:
+                    self.log(f"📊 Generating report in {self.output_dir}...")
+                    self.report_signal.emit("Generating report, please wait...")
+                    try:
+                        result = Reporting.generate_report(self.output_dir)
+                        pdf_path = result.get("pdf")
+                        self.report_signal.emit("✅ Report generated successfully!")
+                        if pdf_path:
+                            self.log(f"✅ Report saved to {pdf_path}")
+                        else:
+                            self.log("✅ Report generation complete")
+                    except Exception as e:
+                        error_msg = f"Report generation failed: {str(e)}"
+                        self.report_signal.emit(f"❌ {error_msg}")
+                        self.log(f"❌ {error_msg}")
             
-            # Step 8: Complete
+            # Step 9: Complete
             self.log("✅ Automation completed successfully")
             self.finished_signal.emit(True)
             
@@ -462,7 +467,8 @@ class MainWindow(QtWidgets.QWidget):
         super().__init__()
         self.setWindowTitle("QT Insite Automation — Atlantic Electric")
         self.setMinimumSize(920, 560)
-        self.worker = None
+        self.worker: Optional[AutomationWorker] = None
+        self.current_output_dir: Optional[Path] = None
         self._build_ui()
         self.setStyleSheet(STYLE)
 
@@ -637,6 +643,17 @@ class MainWindow(QtWidgets.QWidget):
         self.log.setPlaceholderText("Status and log messages will appear here...")
         outer.addWidget(self.log, stretch=1)
 
+        # Output path display
+        path_row = QtWidgets.QHBoxLayout()
+        path_row.addStretch()
+        path_label = QtWidgets.QLabel("Output Path:")
+        path_label.setStyleSheet("color: #555; font-size: 14px;")
+        self.output_path_value = QtWidgets.QLabel("Not set")
+        self.output_path_value.setStyleSheet("color: #555; font-size: 14px;")
+        path_row.addWidget(path_label)
+        path_row.addWidget(self.output_path_value)
+        outer.addLayout(path_row)
+
         # Connect button signals
         self.start_btn.clicked.connect(self.start)
         self.stop_btn.clicked.connect(self.stop)
@@ -652,6 +669,21 @@ class MainWindow(QtWidgets.QWidget):
         self.log.verticalScrollBar().setValue(
             self.log.verticalScrollBar().maximum()
         )
+
+    def _update_output_path_label(self, path: Optional[Path]):
+        """Update the output path label to reflect the active directory."""
+        if path:
+            self.output_path_value.setText(str(path))
+        else:
+            self.output_path_value.setText("Not set")
+
+    def _prepare_output_directory(self) -> Path:
+        """Create and return a timestamped output directory for this run."""
+        base_root = Reporting.get_default_output_root()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = base_root / timestamp
+        output_dir.mkdir(parents=True, exist_ok=True)
+        return output_dir
 
     def start(self):
         """
@@ -686,9 +718,30 @@ class MainWindow(QtWidgets.QWidget):
             f"Starting automation: total={total}s, interval={interval}s, "
             f"report={'enabled' if generate_report else 'disabled'}"
         ))
+
+        # Configure output directory if report generation is enabled
+        output_dir: Optional[Path] = None
+        if generate_report:
+            try:
+                output_dir = self._prepare_output_directory()
+                self.current_output_dir = output_dir
+                self._update_output_path_label(output_dir)
+            except Exception as exc:
+                self.append_log(log_msg("GUI", f"Failed to prepare output directory: {exc}"))
+                QtWidgets.QMessageBox.critical(
+                    self,
+                    "Output Directory Error",
+                    "Could not prepare the output directory. Please check file permissions and try again."
+                )
+                self.start_btn.setEnabled(True)
+                self.stop_btn.setEnabled(False)
+                return
+        else:
+            self.current_output_dir = None
+            self._update_output_path_label(None)
         
         # Create and start worker thread
-        self.worker = AutomationWorker(total, interval, generate_report)
+        self.worker = AutomationWorker(total, interval, generate_report, output_dir=output_dir)
         self.worker.log_signal.connect(self.append_log)
         self.worker.finished_signal.connect(self.done)
         self.worker.report_signal.connect(self.append_log)
