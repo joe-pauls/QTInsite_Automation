@@ -17,6 +17,7 @@ from pathlib import Path
 import pandas as pd
 import re
 import sys
+import math
 from datetime import datetime, timedelta
 import plotly.graph_objects as go
 from PIL import Image as PILImage
@@ -28,10 +29,15 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as RL
 import weather_data
 
 # ========== CONFIGURATION ==========
-INPUT_DIR = Path(r"C:\Users\pauls\OneDrive\Desktop\USC\Fall '25\QT Insite Automation\10_14_Test_750V\10_14_Test_750V\10_14_Test-2000")
-OUTPUT_DIR = INPUT_DIR / "Summary"
+DEFAULT_INPUT_DIR = Path(r"C:\Users\pauls\OneDrive\Desktop\USC\Fall '25\QT Insite Automation\10_14_Test_750V\10_14_Test_750V\10_14_Test-2000")
+DEFAULT_OUTPUT_ROOT = DEFAULT_INPUT_DIR / "Summary"
+
+INPUT_DIR = DEFAULT_INPUT_DIR
+OUTPUT_DIR = DEFAULT_OUTPUT_ROOT
 OUTPUT_CSV = OUTPUT_DIR / "measurements_summary.csv"
 OUTPUT_PLOT_PNG = OUTPUT_DIR / "resistance_plot.png"
+OUTPUT_NORMALIZED_PLOT_PNG = OUTPUT_DIR / "resistance_normalized_plot.png"
+OUTPUT_WEATHER_PLOT_PNG = OUTPUT_DIR / "weather_plot.png"
 OUTPUT_PDF = OUTPUT_DIR / "Circuit_Integrity_Report.pdf"
 LOGO_FILENAME = "AtlanticElectricLogo.png"
 COMPANY_NAME = "Atlantic Electric"
@@ -53,6 +59,34 @@ LIGHT_GRAY = "#E6E6E6"
 # Filename pattern for extracting timestamps
 FNAME_TS_RE = re.compile(r'(\d{8})_(\d{6})')
 # ====================================
+
+def configure_paths(*, input_dir: Path | str | None = None, output_dir: Path | str | None = None) -> Path:
+    """Configure global input/output paths for the current report run."""
+    global INPUT_DIR, OUTPUT_DIR, OUTPUT_CSV, OUTPUT_PLOT_PNG, OUTPUT_NORMALIZED_PLOT_PNG, OUTPUT_WEATHER_PLOT_PNG, OUTPUT_PDF
+
+    if input_dir is not None:
+        INPUT_DIR = Path(input_dir)
+    else:
+        INPUT_DIR = Path(INPUT_DIR)
+
+    if output_dir is not None:
+        OUTPUT_DIR = Path(output_dir)
+    else:
+        OUTPUT_DIR = Path(DEFAULT_OUTPUT_ROOT)
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_CSV = OUTPUT_DIR / "measurements_summary.csv"
+    OUTPUT_PLOT_PNG = OUTPUT_DIR / "resistance_plot.png"
+    OUTPUT_NORMALIZED_PLOT_PNG = OUTPUT_DIR / "resistance_normalized_plot.png"
+    OUTPUT_WEATHER_PLOT_PNG = OUTPUT_DIR / "weather_plot.png"
+    OUTPUT_PDF = OUTPUT_DIR / "Circuit_Integrity_Report.pdf"
+    return OUTPUT_DIR
+
+
+def get_default_output_root() -> Path:
+    """Return the default directory where report artifacts are stored."""
+    return Path(DEFAULT_OUTPUT_ROOT)
+
 
 def extract_datetime_from_filename(fname: str):
     m = FNAME_TS_RE.search(fname)
@@ -97,9 +131,6 @@ def collect_measurements():
     result_df["day"] = result_df["datetime"].dt.strftime("%Y-%m-%d")
     result_df["time_str"] = result_df["datetime"].dt.strftime("%H:%M")
 
-    # save CSV (includes new columns)
-    result_df.to_csv(OUTPUT_CSV, index=False)
-    print(f"\nSaved summary to: {OUTPUT_CSV}\n")
     return result_df
 
 
@@ -319,7 +350,102 @@ def create_static_plot_png(df: pd.DataFrame) -> bool:
         print("   Install kaleido: pip install kaleido")
         return False
 
-def integrate_weather(df: pd.DataFrame, output_dir: Path, icao: str = "KCAE") -> Path | None:
+
+def create_normalized_plot_png(df: pd.DataFrame) -> bool:
+    """Create normalized resistance plot if normalized data is available."""
+    if df.empty or "resistance_normalized_40c" not in df.columns:
+        return False
+
+    series = pd.to_numeric(df["resistance_normalized_40c"], errors="coerce")
+    if series.dropna().empty:
+        return False
+
+    df_plot = df.copy()
+    df_plot["datetime"] = pd.to_datetime(df_plot["datetime"])
+    df_plot = df_plot.sort_values("datetime").reset_index(drop=True)
+
+    x = df_plot["datetime"].tolist()
+    y = series.tolist()
+    start, end = df_plot["datetime"].min(), df_plot["datetime"].max()
+
+    freq = _calculate_tick_frequency(start, end)
+    tick_start = _align_tick_start(start, freq)
+    tick_vals = pd.date_range(start=tick_start, end=end + pd.Timedelta(minutes=1), freq=freq)
+    tick_text = [t.strftime("%H:%M") for t in tick_vals]
+
+    days = pd.to_datetime(df_plot["datetime"]).dt.floor("D").unique()
+    shapes = _create_day_separators(days, start, end)
+    annotations = _create_date_annotations(df_plot["datetime"], start, end, y_position=-0.1)
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=x,
+        y=y,
+        mode="lines+markers",
+        name="Normalized Resistance",
+        line=dict(width=2.5, color=ATLANTIC_RED),
+        marker=dict(size=7, color=ATLANTIC_RED),
+        hovertemplate="%{x|%Y-%m-%d %H:%M:%S}<br>Normalized: %{y:,.2f} Ω<extra></extra>"
+    ))
+
+    fig.update_layout(
+        template="plotly_white",
+        title=dict(
+            text="Insulation Resistance (Normalized to 40°C)",
+            x=0.01,
+            xanchor="left",
+            font=dict(size=24, family="Arial", color=DARK_GRAY, weight="bold")
+        ),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="center",
+            x=0.5,
+            font=dict(size=16, family="Arial", color=DARK_GRAY)
+        ),
+        margin=dict(l=80, r=50, t=100, b=130),
+        width=PNG_WIDTH,
+        height=PNG_HEIGHT,
+        shapes=shapes,
+        annotations=annotations,
+        font=dict(family="Arial", size=16, color=DARK_GRAY)
+    )
+
+    fig.update_xaxes(
+        type="date",
+        tickmode="array",
+        tickvals=tick_vals,
+        ticktext=tick_text,
+        tickangle=0,
+        showgrid=True,
+        gridcolor=LIGHT_GRAY,
+        gridwidth=1,
+        zeroline=False,
+        title=dict(text="Datetime", font=dict(size=18, family="Arial", color=DARK_GRAY)),
+        tickfont=dict(size=16, family="Arial", color=DARK_GRAY),
+        range=[start - pd.Timedelta(minutes=1), end + pd.Timedelta(minutes=1)]
+    )
+
+    fig.update_yaxes(
+        title=dict(text="Normalized Resistance (Ohms)", font=dict(size=18, family="Arial", color=DARK_GRAY)),
+        tickfont=dict(size=16, family="Arial", color=DARK_GRAY),
+        showgrid=True,
+        gridcolor=LIGHT_GRAY,
+        gridwidth=1,
+        zeroline=False,
+        tickformat="~s"
+    )
+
+    try:
+        fig.write_image(str(OUTPUT_NORMALIZED_PLOT_PNG), width=PNG_WIDTH, height=PNG_HEIGHT, scale=1)
+        print(f"✅ Normalized resistance plot saved: {OUTPUT_NORMALIZED_PLOT_PNG}")
+        return True
+    except Exception as exc:
+        print(f"❌ Normalized plot export failed: {exc}")
+        return False
+
+def integrate_weather(df: pd.DataFrame, output_dir: Path, icao: str = "KCAE") -> tuple[Path | None, pd.DataFrame | None, str | None]:
     """
     Fetch weather data and create weather plot for the measurement time range.
     
@@ -345,20 +471,20 @@ def integrate_weather(df: pd.DataFrame, output_dir: Path, icao: str = "KCAE") ->
         # Validate input data
         if df is None or df.empty:
             print("No resistance measurements; skipping weather integration.")
-            return None
+            return None, None, None
 
         # Ensure output directory exists
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        weather_png = output_dir / "weather_plot.png"
+        weather_png = OUTPUT_WEATHER_PLOT_PNG
 
         # Extract date range from measurement datetimes
         start_dt = pd.to_datetime(df["datetime"].min())
         end_dt = pd.to_datetime(df["datetime"].max())
-        
+
         if pd.isna(start_dt) or pd.isna(end_dt):
             print("Could not determine start/end dates from measurements; skipping weather.")
-            return None
+            return None, None, None
 
         start_date = start_dt.date().strftime("%Y-%m-%d")
         end_date = end_dt.date().strftime("%Y-%m-%d")
@@ -366,43 +492,101 @@ def integrate_weather(df: pd.DataFrame, output_dir: Path, icao: str = "KCAE") ->
         # Fetch hourly weather data from API
         print(f"Fetching weather for {start_date} → {end_date} at ICAO {icao}...")
         try:
-            # Try named parameter first (newer API)
             hourly_df, daily_df, airport_name = weather_data.get_hourly_weather(
                 start_date, end_date, icao_code=icao
             )
         except TypeError:
-            # Fall back to positional argument (older API)
             hourly_df, daily_df, airport_name = weather_data.get_hourly_weather(
                 start_date, end_date, icao
             )
 
-        # Validate weather data retrieved
         if hourly_df is None or hourly_df.empty:
             print("Hourly weather fetch returned no data; skipping weather plot.")
-            return None
+            return None, None, airport_name
 
-        # Match weather timestamps to resistance measurement timestamps
         matched = weather_data.match_weather_to_resistance(df, hourly_df)
         if matched is None or matched.empty:
             print("No matched weather rows for resistance datetimes; skipping weather plot.")
-            return None
+            return None, None, airport_name
 
-        # Generate weather plot PNG
         created = weather_data.create_weather_plot_png(
-            matched, daily_df, str(weather_png), 
-            png_width=PNG_WIDTH, png_height=WEATHER_HEIGHT
+            matched,
+            daily_df,
+            str(weather_png),
+            png_width=PNG_WIDTH,
+            png_height=WEATHER_HEIGHT,
         )
-        
+
         if created:
             print(f"✅ Weather plot created: {weather_png}")
-            return weather_png
-        else:
-            print("❌ Weather plot creation failed.")
-            return None
+            return weather_png, matched, airport_name
+
+        print("❌ Weather plot creation failed.")
+        return None, matched, airport_name
 
     except Exception as exc:
         print(f"❌ Weather integration failed: {exc}")
-        return None
+        return None, None, None
+
+
+def _enrich_with_weather(df: pd.DataFrame, matched: pd.DataFrame | None) -> pd.DataFrame:
+    """Merge matched weather metrics with resistance data frame."""
+    if matched is None or matched.empty:
+        return df
+
+    enriched = df.copy()
+    enriched["datetime"] = pd.to_datetime(enriched["datetime"], errors="coerce")
+    if enriched["datetime"].dt.tz is None:
+        enriched["_datetime_local"] = enriched["datetime"].dt.tz_localize(
+            weather_data.TIMEZONE,
+            nonexistent="shift_forward",
+            ambiguous="NaT",
+        )
+    else:
+        enriched["_datetime_local"] = enriched["datetime"].dt.tz_convert(weather_data.TIMEZONE)
+
+    weather = matched.copy()
+    weather["res_datetime"] = pd.to_datetime(weather["res_datetime"], errors="coerce")
+
+    enriched = enriched.merge(
+        weather,
+        left_on="_datetime_local",
+        right_on="res_datetime",
+        how="left"
+    )
+
+    enriched.drop(columns=["_datetime_local", "res_datetime"], inplace=True, errors="ignore")
+
+    enriched["temperature_f"] = pd.to_numeric(enriched.get("temperature_2m"), errors="coerce")
+    enriched["relative_humidity_percent"] = pd.to_numeric(
+        enriched.get("relative_humidity_2m"), errors="coerce"
+    )
+    enriched["precipitation_in"] = pd.to_numeric(enriched.get("precipitation"), errors="coerce")
+
+    enriched.drop(columns=["temperature_2m", "relative_humidity_2m", "precipitation", "matched_hour"], inplace=True, errors="ignore")
+    return enriched
+
+
+def _compute_normalized_resistance(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute resistance normalized to 40°C using provided temperature column."""
+    if "temperature_f" not in df.columns:
+        df["resistance_normalized_40c"] = pd.NA
+        return df
+
+    def _norm(row):
+        temp_f = row.get("temperature_f")
+        resistance = row.get("resistance")
+        if pd.isna(temp_f) or pd.isna(resistance):
+            return pd.NA
+        temp_c = (temp_f - 32) * (5.0 / 9.0)
+        kt = 0.5 * math.exp((40 - temp_c) / 10)
+        try:
+            return float(resistance) * kt
+        except Exception:
+            return pd.NA
+
+    df["resistance_normalized_40c"] = df.apply(_norm, axis=1)
+    return df
 
 
 def _build_logo_rlimage(logo_path: Path):
@@ -464,7 +648,14 @@ def _build_logo_rlimage(logo_path: Path):
         print(f"⚠️  ReportLab failed to create Image: {e}")
         return None
 
-def build_pdf_report(df: pd.DataFrame, png_available: bool):
+def build_pdf_report(
+    df: pd.DataFrame,
+    *,
+    resistance_plot_ok: bool,
+    normalized_plot_ok: bool,
+    weather_plot_ok: bool,
+    airport_name: str | None = None,
+):
     """
     Generate professional PDF report with Atlantic Electric branding.
     
@@ -537,7 +728,7 @@ def build_pdf_report(df: pd.DataFrame, png_available: bool):
     story.append(Spacer(1, 12))
 
     # ========== RESISTANCE PLOT ==========
-    if png_available and OUTPUT_PLOT_PNG.exists():
+    if resistance_plot_ok and OUTPUT_PLOT_PNG.exists():
         try:
             resistance_img = RLImage(
                 str(OUTPUT_PLOT_PNG),
@@ -560,9 +751,29 @@ def build_pdf_report(df: pd.DataFrame, png_available: bool):
         ))
         story.append(Spacer(1, 8))
 
+    # ========== NORMALIZED RESISTANCE PLOT ==========
+    if normalized_plot_ok and OUTPUT_NORMALIZED_PLOT_PNG.exists():
+        try:
+            normalized_img = RLImage(
+                str(OUTPUT_NORMALIZED_PLOT_PNG),
+                width=6.9 * inch,
+                height=3.6 * inch
+            )
+            story.append(normalized_img)
+            story.append(Spacer(1, 12))
+        except Exception as exc:
+            print(f"⚠️  Failed to embed normalized plot: {exc}")
+
+    if airport_name:
+        story.append(Paragraph(
+            f"Weather station: {airport_name}",
+            styles["Normal"]
+        ))
+        story.append(Spacer(1, 8))
+
     # ========== WEATHER PLOT ==========
-    weather_png_path = OUTPUT_DIR / "weather_plot.png"
-    if weather_png_path.exists():
+    weather_png_path = OUTPUT_WEATHER_PLOT_PNG
+    if weather_plot_ok and weather_png_path.exists():
         try:
             # Weather plot: 1400x500px embedded at 6.9"x2.5" to match aspect ratio
             weather_img = RLImage(
@@ -577,7 +788,14 @@ def build_pdf_report(df: pd.DataFrame, png_available: bool):
 
     # ========== DATA TABLE ==========
     # Build table data with formatted resistance values
-    table_data = [["Date", "Resistance"]]  # Header row
+    table_data = [[
+        "Date",
+        "Resistance",
+        "Normalized (40°C)",
+        "Temp (°F)",
+        "Humidity (%)",
+        "Rainfall (in)"
+    ]]
     
     for _, row in df.iterrows():
         # Format datetime
@@ -602,12 +820,37 @@ def build_pdf_report(df: pd.DataFrame, png_available: bool):
             except Exception:
                 res_str = "N/A"
 
-        table_data.append([dt_str, res_str])
+        norm_res = row.get("resistance_normalized_40c")
+        if pd.isna(norm_res):
+            norm_str = "N/A"
+        else:
+            try:
+                norm_val = float(norm_res)
+                if norm_val >= 1e9:
+                    norm_str = f"{norm_val/1e9:,.2f} GΩ"
+                elif norm_val >= 1e6:
+                    norm_str = f"{norm_val/1e6:,.2f} MΩ"
+                elif norm_val >= 1e3:
+                    norm_str = f"{norm_val/1e3:,.2f} kΩ"
+                else:
+                    norm_str = f"{norm_val:,.0f} Ω"
+            except Exception:
+                norm_str = "N/A"
+
+        temp_val = row.get("temperature_f")
+        hum_val = row.get("relative_humidity_percent")
+        rain_val = row.get("precipitation_in")
+
+        temp_str = f"{float(temp_val):.1f}" if pd.notna(temp_val) else "N/A"
+        hum_str = f"{float(hum_val):.0f}" if pd.notna(hum_val) else "N/A"
+        rain_str = f"{float(rain_val):.2f}" if pd.notna(rain_val) else "N/A"
+
+        table_data.append([dt_str, res_str, norm_str, temp_str, hum_str, rain_str])
 
     # Create and style table with Atlantic Electric branding
     table = Table(
         table_data, 
-        colWidths=[3.5 * inch, 3.5 * inch], 
+        colWidths=[2.0 * inch, 1.1 * inch, 1.1 * inch, 0.9 * inch, 0.9 * inch, 0.9 * inch], 
         repeatRows=1  # Repeat header on page breaks
     )
     
@@ -644,53 +887,65 @@ def build_pdf_report(df: pd.DataFrame, png_available: bool):
 
 
 
-def main():
-    """
-    Main execution function for Circuit Integrity Report Generator.
-    
-    Orchestrates the complete report generation workflow:
-    1. Collect resistance measurements from CSV files
-    2. Generate resistance vs time plot
-    3. Fetch and integrate weather data
-    4. Build comprehensive PDF report
-    
-    Output files created in OUTPUT_DIR:
-    - measurements_summary.csv: Raw measurement data
-    - resistance_plot.png: Resistance over time visualization
-    - weather_plot.png: Weather conditions over time (if successful)
-    - Circuit_Integrity_Report.pdf: Complete professional report
-    """
+def _run_report_pipeline() -> dict[str, object]:
+    """Execute complete report workflow and return artifact summary."""
     print("=" * 60)
     print("Circuit Integrity Report Generator")
     print("=" * 60)
-    
-    # Step 1: Collect measurements from CSV files
-    print("\n[1/4] Collecting measurements from CSV files...")
+
+    print("\n[1/5] Collecting measurements from CSV files...")
     df = collect_measurements()
-    
-    # Step 2: Generate resistance plot
-    print("\n[2/4] Generating resistance plot...")
-    png_ok = create_static_plot_png(df)
-    
-    # Step 3: Integrate weather data
-    print("\n[3/4] Integrating weather data...")
-    try:
-        weather_png = integrate_weather(df, OUTPUT_DIR, icao="KCAE")
-        if weather_png:
-            print(f"     Weather data successfully integrated")
-        else:
-            print(f"     Weather integration skipped (no data available)")
-    except Exception as e:
-        print(f"⚠️   Weather integration error: {e}")
-        weather_png = None
-    
-    # Step 4: Build PDF report
-    print("\n[4/4] Building PDF report...")
-    build_pdf_report(df, png_ok)
-    
+
+    print("\n[2/5] Generating resistance plot...")
+    resistance_plot_ok = create_static_plot_png(df)
+
+    print("\n[3/5] Integrating weather data...")
+    weather_png, matched_weather, airport_name = integrate_weather(df, OUTPUT_DIR, icao="KCAE")
+    weather_plot_ok = weather_png is not None and Path(weather_png).exists()
+
+    enriched_df = _enrich_with_weather(df, matched_weather)
+    enriched_df = _compute_normalized_resistance(enriched_df)
+
+    print("\n[4/5] Generating normalized resistance plot...")
+    normalized_plot_ok = create_normalized_plot_png(enriched_df)
+
+    enriched_df.to_csv(OUTPUT_CSV, index=False)
+    print(f"Saved enriched summary to: {OUTPUT_CSV}")
+
+    print("\n[5/5] Building PDF report...")
+    build_pdf_report(
+        enriched_df,
+        resistance_plot_ok=resistance_plot_ok,
+        normalized_plot_ok=normalized_plot_ok,
+        weather_plot_ok=weather_plot_ok,
+        airport_name=airport_name,
+    )
+
     print("\n" + "=" * 60)
     print("Report generation complete!")
     print("=" * 60)
+
+    return {
+        "data": enriched_df,
+        "resistance_plot": OUTPUT_PLOT_PNG if resistance_plot_ok else None,
+        "normalized_plot": OUTPUT_NORMALIZED_PLOT_PNG if normalized_plot_ok else None,
+        "weather_plot": OUTPUT_WEATHER_PLOT_PNG if weather_plot_ok else None,
+        "pdf": OUTPUT_PDF,
+        "summary_csv": OUTPUT_CSV,
+        "airport_name": airport_name,
+    }
+
+
+def generate_report(output_dir: Path | str | None = None) -> dict[str, object]:
+    """Entry point for other scripts to run the report pipeline with a target directory."""
+    configure_paths(output_dir=output_dir)
+    return _run_report_pipeline()
+
+
+def main():
+    """CLI entry point using configured defaults."""
+    configure_paths()
+    _run_report_pipeline()
 
 
 if __name__ == "__main__":
