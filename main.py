@@ -1,4 +1,5 @@
 
+
 """
 QT Insite Automation GUI
 
@@ -21,9 +22,12 @@ Dependencies:
 Author: Joseph Pauls
 
 TODO
-- Add checks for whether QT Insite is already running before launching or user is already logged in
+- Add checks for whether QT Insite is already running before launching or user is already logged in (auto-click logout before loggin in)
 - Add options for user to input test voltage level, grounded/ungrounded checkbox, minimum resistance, and integrate those values into the automation sequence
+        --- The same sequence will get edited every time to avoid having to make a new sequence
 - Add option to run a single test immediately to see results without scheduling (with its own configuration panel)
+- Add input box  on gui for airport ICAO code or latitude and longitude coordinates for the weather data
+- Add option to control output folder name and where the files will go (browse for folder, option to create new folder, OR, purely automated based on timestamp of when test was run)
 
 """
 
