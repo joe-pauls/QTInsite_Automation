@@ -29,6 +29,9 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as RL
 import weather_data
 
 # ========== CONFIGURATION ==========
+# When running this file directly, we keep a hardcoded default input directory.
+# When called from main.py, INPUT_DIR will be set to the timestamped output folder
+# created by the app, and outputs will go into a "Summary" subfolder inside it.
 DEFAULT_INPUT_DIR = Path(r"C:\Users\user\Desktop\QTInsite_Automation\QTInsite_Automation\1700VDwell60")
 DEFAULT_OUTPUT_ROOT = DEFAULT_INPUT_DIR / "Summary"
 
@@ -76,17 +79,24 @@ FNAME_TS_RE = re.compile(r'(\d{8})_(\d{6})')
 # ====================================
 
 def configure_paths(*, input_dir: Path | str | None = None, output_dir: Path | str | None = None) -> Path:
-    """Configure global input/output paths for the current report run."""
+    """Configure global input/output paths for the current report run.
+
+    Behavior:
+    - If output_dir is provided (e.g., called from main.py):
+        INPUT_DIR  := output_dir (timestamped folder containing CSVs from QT Insite)
+        OUTPUT_DIR := output_dir/"Summary" (plots, PDF, summary CSV live here)
+    - If output_dir is not provided (running Reporting.py directly):
+        INPUT_DIR  := input_dir if provided else DEFAULT_INPUT_DIR
+        OUTPUT_DIR := DEFAULT_OUTPUT_ROOT (hardcoded Summary under DEFAULT_INPUT_DIR)
+    """
     global INPUT_DIR, OUTPUT_DIR, OUTPUT_CSV, OUTPUT_PLOT_PNG, OUTPUT_NORMALIZED_PLOT_PNG, OUTPUT_WEATHER_PLOT_PNG, OUTPUT_PDF
 
-    if input_dir is not None:
-        INPUT_DIR = Path(input_dir)
-    else:
-        INPUT_DIR = Path(INPUT_DIR)
-
     if output_dir is not None:
-        OUTPUT_DIR = Path(output_dir)
+        ts_root = Path(output_dir)
+        INPUT_DIR = Path(input_dir) if input_dir is not None else ts_root
+        OUTPUT_DIR = ts_root / "Summary"
     else:
+        INPUT_DIR = Path(input_dir) if input_dir is not None else Path(DEFAULT_INPUT_DIR)
         OUTPUT_DIR = Path(DEFAULT_OUTPUT_ROOT)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -99,8 +109,12 @@ def configure_paths(*, input_dir: Path | str | None = None, output_dir: Path | s
 
 
 def get_default_output_root() -> Path:
-    """Return the default directory where report artifacts are stored."""
-    return Path(DEFAULT_OUTPUT_ROOT)
+    """Default root for outputs when called from the app (main.py).
+
+    Returns a folder named "Outputs" in the current working directory. The app
+    will create a timestamped subfolder inside this root for each run.
+    """
+    return Path.cwd() / "Outputs"
 
 
 def generate_recent_weather_preview(

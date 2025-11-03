@@ -48,11 +48,19 @@ DEFAULT_COORDS = {
     "start_field": (1425, 490),
     "system_config": (510, 400),
     "verify_button": (800, 865),
+    "logout_button": (955, 330),
+    "test_sequence_menu": (700, 400),
+    "test_sequence_select": (500, 565),
+    "test_sequence_voltage": (1045, 585),
+    "test_sequence_save":(660, 598),
+    "test_sequence_reporting_tab": (905, 470),
+    "test_sequence_csv_path_start": (1095, 541),
+    "test_sequence_pdf_path_start": (1095, 627),
 }
 
-MOVE_DURATION = 0.5
-ACTION_PAUSE = 0.18
-pyautogui.PAUSE = 0.05
+MOVE_DURATION = 0.5  # unified mouse move duration (slower for reliability)
+ACTION_PAUSE = 0.2   # unified pause between actions (slower to stabilize UI)
+pyautogui.PAUSE = ACTION_PAUSE  # apply same pause to all pyautogui calls
 
 LOGO_PATH = "AtlanticElectricLogo.png"
 
@@ -65,7 +73,7 @@ TEXT = "#222"
 MUTED = "#555"
 
 # Thread-safe stop event used to abort automation quickly
-STOP_EVENT = threading.Event()
+STOP_EVENT = threading.Event()  
 
 # ========== HELPERS ==========
 def log_msg(tag: str, msg: str) -> str:
@@ -88,10 +96,60 @@ def activate_qt_insite_window() -> Optional[object]:
         return None
     if win.isMinimized:
         win.restore()
-        time.sleep(0.5)
+        time.sleep(ACTION_PAUSE)
     win.activate()
-    time.sleep(0.6)
+    time.sleep(ACTION_PAUSE)
     return win
+
+def _center_qt_window(win) -> bool:
+    """Center the QT Insite window on the primary screen.
+
+    Returns True if the window was moved or is already centered, False on error.
+    """
+    try:
+        screen_w, screen_h = pyautogui.size()
+        w, h = win.width, win.height
+        target_x = max(0, (screen_w - w) // 2)
+        target_y = max(0, (screen_h - h) // 2)
+
+        # Consider it centered if within a small threshold
+        thresh = 20
+        if abs(win.left - target_x) <= thresh and abs(win.top - target_y) <= thresh:
+            return True
+
+        win.moveTo(target_x, target_y)
+        time.sleep(ACTION_PAUSE)
+        return True
+    except Exception:
+        return False
+
+def ensure_qt_open_and_centered(*, login_if_launched: bool = True) -> bool:
+    """Ensure QT Insite is open, active, and centered.
+
+    - If window not found: launch, activate, optionally run login sequence.
+    - If found: activate and center if needed.
+    Returns True when ready for GUI interactions, False on failure/stop.
+    """
+    if STOP_EVENT.is_set():
+        return False
+
+    win = activate_qt_insite_window()
+    if not win:
+        # Not open — try to launch
+        if not launch_qtinsite_using_shortcut_style():
+            return False
+        if STOP_EVENT.is_set():
+            return False
+        win = activate_qt_insite_window()
+        if not win:
+            return False
+        # If we just launched, optionally login
+        if login_if_launched and not STOP_EVENT.is_set():
+            login_coords()
+
+    # Center window if needed
+    _center_qt_window(win)
+    return True
 
 def launch_qtinsite_using_shortcut_style(wait: float = 6.0) -> bool:
     """
@@ -120,14 +178,14 @@ def click_at(x: int, y: int, dur: float = MOVE_DURATION):
     """
     if STOP_EVENT.is_set():
         return
-    safe_dur = min(dur, 0.05)  # keep moves very short so we can stop quickly
+    safe_dur = dur
     try:
         if STOP_EVENT.is_set():
             return
         pyautogui.moveTo(x, y, duration=safe_dur)
         # cooperative pause (interruptible)
         elapsed = 0.0
-        step = 0.02
+        step = 0.05
         while elapsed < ACTION_PAUSE:
             if STOP_EVENT.is_set():
                 return
@@ -160,6 +218,8 @@ def login_coords() -> bool:
 
 def verify_connection_coords() -> bool:
     try:
+        if not ensure_qt_open_and_centered(login_if_launched=True):
+            return False
         sx, sy = DEFAULT_COORDS["system_config"]
         vx, vy = DEFAULT_COORDS["verify_button"]
         click_at(sx, sy)
@@ -170,6 +230,8 @@ def verify_connection_coords() -> bool:
 
 def run_test_coords() -> bool:
     try:
+        if not ensure_qt_open_and_centered(login_if_launched=True):
+            return False
         rx, ry = DEFAULT_COORDS["run_field"]
         sx, sy = DEFAULT_COORDS["start_field"]
         click_at(rx, ry)
@@ -211,22 +273,190 @@ class AutomationWorker(QtCore.QThread):
         STOP_EVENT.set()
 
     def edit_test_sequence(self):
+        """Edit the test sequence in QT Insite according to provided parameters.
+
+        Steps:
+        - Ensure QT Insite window is active and centered
+        - Open test sequence (menu -> select)
+        - Set voltage: double-click field, delete, type value
+        - Save
+        - Go to Reporting tab
+        - For CSV path: select by click-drag 400px to the right, delete, type new path '.../Test_$D_$T.csv'
+        - For PDF path: same but '.../PDFTest_$D_$T.pdf'
         """
-        Placeholder function to edit the test sequence in QT Insite.
-        Uses cooperative sleeps so STOP_EVENT can interrupt quickly.
-        """
-        self.log("Editing test sequence (placeholder)...")
+        if self.stop_flag or STOP_EVENT.is_set():
+            return
+
+        self.log("Editing test sequence...")
         self.log(f"  - Voltage: {self.test_voltage}V")
         self.log(f"  - Circuit: {'Grounded' if self.is_grounded else 'Ungrounded'}")
-        # cooperative wait (1s) that checks STOP_EVENT / stop_flag frequently
-        elapsed = 0.0
-        step = 0.1
-        wait_for = 1.0
-        while elapsed < wait_for:
+
+        # Helper: cooperative short sleep
+        def _pause():
+            elapsed = 0.0
+            step = 0.05
+            while elapsed < ACTION_PAUSE:
+                if self.stop_flag or STOP_EVENT.is_set():
+                    return False
+                time.sleep(step)
+                elapsed += step
+            return True
+
+        # Helper: drag selection from a start point by dx,dy
+        def _drag_from(x: int, y: int, dx: int, dy: int):
             if self.stop_flag or STOP_EVENT.is_set():
                 return
-            time.sleep(step)
-            elapsed += step
+            try:
+                pyautogui.moveTo(x, y, duration=MOVE_DURATION)
+                if not _pause():
+                    return
+                pyautogui.mouseDown()
+                if not _pause():
+                    pyautogui.mouseUp()
+                    return
+                pyautogui.moveRel(dx, dy, duration=MOVE_DURATION)
+                if not _pause():
+                    pyautogui.mouseUp()
+                    return
+                pyautogui.mouseUp()
+                _pause()
+            except Exception:
+                return
+
+        # 1) Ensure window active and centered (launch+login if needed)
+        if not ensure_qt_open_and_centered(login_if_launched=True):
+            self.log("  - Warning: Could not prepare QT Insite window")
+            return
+
+        if self.stop_flag or STOP_EVENT.is_set():
+            return
+
+        c = DEFAULT_COORDS
+
+        # 2) Open test sequence via menu/select
+        try:
+            mx, my = c["test_sequence_menu"]
+            sx, sy = c["test_sequence_select"]
+            click_at(mx, my)
+            if not _pause():
+                return
+            click_at(sx, sy)
+            if not _pause():
+                return
+        except Exception:
+            self.log("  - Warning: Could not open test sequence via menu/select")
+
+        if self.stop_flag or STOP_EVENT.is_set():
+            return
+
+        # 3) Set voltage
+        try:
+            vx, vy = c["test_sequence_voltage"]
+            if self.stop_flag or STOP_EVENT.is_set():
+                return
+            pyautogui.moveTo(vx, vy, duration=MOVE_DURATION)
+            if not _pause():
+                return
+            pyautogui.doubleClick()
+            if not _pause():
+                return
+            pyautogui.press('backspace')
+            if not _pause():
+                return
+            pyautogui.typewrite(str(self.test_voltage), interval=0.02)
+            if not _pause():
+                return
+        except Exception:
+            self.log("  - Warning: Could not set test sequence voltage")
+
+        if self.stop_flag or STOP_EVENT.is_set():
+            return
+
+        # 4) Save the sequence
+        try:
+            svx, svy = c["test_sequence_save"]
+            click_at(svx, svy)
+            if not _pause():
+                return
+        except Exception:
+            self.log("  - Warning: Could not save test sequence")
+
+        if self.stop_flag or STOP_EVENT.is_set():
+            return
+
+        # 5) Go to Reporting tab
+        try:
+            rtx, rty = c["test_sequence_reporting_tab"]
+            click_at(rtx, rty)
+            if not _pause():
+                return
+        except Exception:
+            self.log("  - Warning: Could not open Reporting tab")
+
+        # Compose output paths
+        try:
+            base = self.output_dir if self.output_dir else Reporting.get_default_output_root()
+        except Exception:
+            base = None
+        base_str = (base.as_posix() if base else str(Path.home().as_posix()))
+        csv_path = f"{base_str}/Test_$D_$T.csv"
+        pdf_path = f"{base_str}/PDFTest_$D_$T.pdf"
+
+        if self.stop_flag or STOP_EVENT.is_set():
+            return
+
+        # 6) CSV path: click start, Ctrl+A to select all, delete, type
+        try:
+            cx, cy = c["test_sequence_csv_path_start"]
+            click_at(cx, cy)
+            if not _pause():
+                return
+            pyautogui.hotkey('ctrl', 'a')
+            if not _pause():
+                return
+            pyautogui.press('backspace')
+            if not _pause():
+                return
+            pyautogui.typewrite(csv_path, interval=0.01)
+            if not _pause():
+                return
+        except Exception:
+            self.log("  - Warning: Could not set CSV output path")
+
+        if self.stop_flag or STOP_EVENT.is_set():
+            return
+
+        # 7) PDF path: click start, Ctrl+A to select all, delete, type
+        try:
+            px, py = c["test_sequence_pdf_path_start"]
+            click_at(px, py)
+            if not _pause():
+                return
+            pyautogui.hotkey('ctrl', 'a')
+            if not _pause():
+                return
+            pyautogui.press('backspace')
+            if not _pause():
+                return
+            pyautogui.typewrite(pdf_path, interval=0.01)
+            if not _pause():
+                return
+        except Exception:
+            self.log("  - Warning: Could not set PDF output path")
+
+        if self.stop_flag or STOP_EVENT.is_set():
+            return
+
+        # 8) Final save
+        try:
+            svx, svy = c["test_sequence_save"]
+            click_at(svx, svy)
+            if not _pause():
+                return
+        except Exception:
+            self.log("  - Warning: Could not perform final save")
+
+        self.log("  - Test sequence updated")
 
     def run(self):
         """
@@ -240,6 +470,9 @@ class AutomationWorker(QtCore.QThread):
             if STOP_EVENT.is_set() or self.stop_flag:
                 self.finished_signal.emit(False)
                 return
+
+            # Determine if QT Insite is already open before launching
+            pre_existing = find_qt_window() is not None
 
             if not launch_qtinsite_using_shortcut_style():
                 self.log("❌ Launch failed")
@@ -256,6 +489,26 @@ class AutomationWorker(QtCore.QThread):
                 self.log("❌ Window not found")
                 self.finished_signal.emit(False)
                 return
+
+            # If already open when we started, log out first
+            if pre_existing and not (self.stop_flag or STOP_EVENT.is_set()):
+                try:
+                    self.log("Logging out existing session...")
+                    lx, ly = DEFAULT_COORDS.get("logout_button", (None, None))
+                    if lx is None or ly is None:
+                        self.log("  - Warning: 'logout_button' coordinate not set; skipping logout")
+                    else:
+                        click_at(int(lx), int(ly))
+                        # cooperative short wait using ACTION_PAUSE
+                        elapsed = 0.0
+                        step = 0.05
+                        while elapsed < ACTION_PAUSE:
+                            if self.stop_flag or STOP_EVENT.is_set():
+                                break
+                            time.sleep(step)
+                            elapsed += step
+                except Exception:
+                    self.log("  - Warning: Could not click logout; proceeding to login")
 
             self.log("Logging in...")
             if STOP_EVENT.is_set() or self.stop_flag:
@@ -365,7 +618,6 @@ QSpinBox, QComboBox, QLineEdit {{
     border-radius: 6px;
     font-size: 16px;
     min-height: 32px;
-    qproperty-alignment: AlignVCenter;
 }}
 QTextEdit {{
     background: white;
@@ -406,7 +658,7 @@ class MainWindow(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("QT Insite Automation — Atlantic Electric")
-        self.setMinimumSize(1400, 1000)
+        self.setFixedSize(800, 800)
         self.worker: Optional[AutomationWorker] = None
         self.current_output_dir: Optional[Path] = None
         self._build_ui()
@@ -414,7 +666,7 @@ class MainWindow(QtWidgets.QWidget):
 
     def _build_ui(self):
         outer = QtWidgets.QVBoxLayout(self)
-        outer.setContentsMargins(20, 12, 20, 20)
+        outer.setContentsMargins(12, 12, 12, 12)
         outer.setSpacing(8)
 
         # HEADER
@@ -435,16 +687,13 @@ class MainWindow(QtWidgets.QWidget):
 
         # Logo
         logo_lbl = QtWidgets.QLabel()
-        logo_lbl.setFixedSize(200, 200)
+        logo_lbl.setFixedSize(200, 100)
         logo_lbl.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignTop)
         logo_path = Path(LOGO_PATH)
         if logo_path.exists():
             pix = QtGui.QPixmap(str(logo_path)).scaled(
-                200, 200, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation
+                200, 100, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation
             )
-        else:
-            pix = QtGui.QPixmap(200, 200)
-            pix.fill(QtGui.QColor(ACCENT_RED))
         logo_lbl.setPixmap(pix)
         logo_container = QtWidgets.QHBoxLayout()
         logo_container.addStretch()
@@ -453,12 +702,9 @@ class MainWindow(QtWidgets.QWidget):
 
         outer.addLayout(header_h)
 
-        # Remove space completely so Test Parameters touches header
-        outer.addSpacing(0)
-
         # MAIN CONTENT GRID
         content = QtWidgets.QGridLayout()
-        content.setHorizontalSpacing(12)
+        content.setHorizontalSpacing(8)
         content.setVerticalSpacing(8)
         outer.addLayout(content)
 
@@ -470,7 +716,7 @@ class MainWindow(QtWidgets.QWidget):
         # ======= Test Parameters GroupBox (no visible title) =======
         g_params = QtWidgets.QGroupBox()
         g_params.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
-        g_params.setMinimumHeight(170)
+        g_params.setFixedHeight(150)
 
         params_layout = QtWidgets.QHBoxLayout()
         params_layout.setContentsMargins(16, 6, 16, 6)
@@ -484,7 +730,7 @@ class MainWindow(QtWidgets.QWidget):
         # Voltage (top-left)
         voltage_box = QtWidgets.QHBoxLayout()
         voltage_label = QtWidgets.QLabel("Test Voltage (V):")
-        voltage_label.setMinimumWidth(150)
+        voltage_label.setFixedWidth(150)
         voltage_label.setFixedHeight(36)
         self.voltage_spin = QtWidgets.QSpinBox()
         self.voltage_spin.setRange(1, 5000)
@@ -502,7 +748,7 @@ class MainWindow(QtWidgets.QWidget):
         grounding_box = QtWidgets.QHBoxLayout()
         grounding_box.setAlignment(QtCore.Qt.AlignVCenter)
         grounding_label = QtWidgets.QLabel("Grounding:")
-        grounding_label.setMinimumWidth(150)
+        grounding_label.setFixedWidth(150)
         grounding_label.setFixedHeight(36)
         self.grounded_cb = QtWidgets.QCheckBox("Circuit is grounded")
         self.grounded_cb.setChecked(True)
@@ -521,9 +767,8 @@ class MainWindow(QtWidgets.QWidget):
 
         # Total Duration (top-right)
         dur_box = QtWidgets.QHBoxLayout()
-        dur_box.setAlignment(QtCore.Qt.AlignVCenter)
         dur_label = QtWidgets.QLabel("Total Duration:")
-        dur_label.setMinimumWidth(120)
+        dur_label.setFixedWidth(150)
         dur_label.setFixedHeight(36)
         self.duration_spin = QtWidgets.QSpinBox()
         self.duration_spin.setRange(0, 1000000)
@@ -576,7 +821,7 @@ class MainWindow(QtWidgets.QWidget):
         # ======= Reporting GroupBox (no visible title) =======
         g_report = QtWidgets.QGroupBox()
         g_report.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
-        g_report.setMinimumHeight(120)
+        g_report.setFixedHeight(120)
 
         report_layout = QtWidgets.QVBoxLayout()
         report_layout.setContentsMargins(16, 8, 16, 8)
@@ -598,15 +843,16 @@ class MainWindow(QtWidgets.QWidget):
         icao_row = QtWidgets.QHBoxLayout()
         icao_row.setAlignment(QtCore.Qt.AlignVCenter)
         icao_label = QtWidgets.QLabel("Airport ICAO Code:")
-        icao_label.setMinimumWidth(140)
+        icao_label.setFixedWidth(150)
         icao_label.setFixedHeight(36)
-        self.icao_input = QtWidgets.QLineEdit("KLAX")
-        self.icao_input.setPlaceholderText("e.g. KLAX")
+        icao_label.setAlignment(QtCore.Qt.AlignVCenter)
+        self.icao_input = QtWidgets.QLineEdit("KCUB")
+        self.icao_input.setPlaceholderText("e.g. KCUB")
         self.icao_input.setMaxLength(4)
         self.icao_input.setFixedHeight(36)
         self.icao_input.setFixedWidth(90)
-        self.icao_input.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
-        self.icao_input.setToolTip("Enter the 4-letter ICAO code for the nearest airport (e.g., KLAX)")
+        self.icao_input.setAlignment(QtCore.Qt.AlignVCenter)
+        self.icao_input.setToolTip("Enter the 4-letter ICAO code for the nearest airport (e.g., KCUB)")
         icao_row.addWidget(icao_label)
         icao_row.addWidget(self.icao_input)
         icao_row.addStretch()
