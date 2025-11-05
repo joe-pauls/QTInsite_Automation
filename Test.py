@@ -1,3 +1,10 @@
+"""
+Legacy demo UI for QT Insite automation.
+
+This file was used early on as a minimal prototype to validate launching,
+window activation, and a basic run loop. The main application is in `main.py`.
+Kept here as a reference/example; it isn't invoked by the main app.
+"""
 
 import sys, time, subprocess, traceback
 from pathlib import Path

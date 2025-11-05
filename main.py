@@ -1,19 +1,29 @@
 """
 QT Insite Automation GUI
 
+This app automates QT Insite: launch/login, edit a single known test sequence,
+run tests (once or on a schedule), and save outputs into a timestamped folder.
+It also generates a PDF report and can pull recent weather for context.
+
+Design notes:
+- GUI automation is timing-sensitive. We intentionally slow down motions and
+    always activate/center the window before clicking to avoid missed targets. The mouse should not be touched while the automation is running.
+- If QT Insite was already open when you start, we click Logout first to avoid
+    odd session states before logging in again.
+
 Author: Joseph Pauls
 
 TODO 
-- Add checks for whether QT Insite is already running before launching or user is already logged in (auto-click logout before loggin in) 
+✅ Add checks for whether QT Insite is already running before launching or user is already logged in (auto-click logout before loggin in) 
 ✅ Add options for user to input test voltage level, grounded/ungrounded checkbox, and integrate those values into the automation sequence 
-    - The same sequence will get edited every time to avoid having to make a new sequence (placeholder is edit_test_sequence function)
+✅  - The same sequence will get edited every time to avoid having to make a new sequence (placeholder is edit_test_sequence function)
 ✅ Add option to run a single test immediately to see results without scheduling (with its own configuration panel) 
 ✅ Add input box on gui for airport ICAO code or latitude and longitude coordinates for the weather data 
 ✅ When the test is run, a new folder with the datetime is created and all files are outputted into it. The summary folder is then created inside that folder.
 ✅ Check for rain in the past 3 days since testing and add the total rainfall amount for the past 3 days to the report summary table
 ✅ Get rid of weather previews
 ✅ make sure only one timestamped folder is being created when a test is run, not when the reporting is generated
-- add check for making sure qt insite is open and logged in before running every test (in case it crashes)
+✅ add check for making sure qt insite is open and logged in before running every test (in case it crashes)
 ✅ change output path at bottom right of gui to show the current output path being used
 ✅ Make sure the stop button completely stops the automation, it seems to continue moving the mouse even after stopping
 """
@@ -102,9 +112,13 @@ def activate_qt_insite_window() -> Optional[object]:
     return win
 
 def _center_qt_window(win) -> bool:
-    """Center the QT Insite window on the primary screen.
+    """Center the QT Insite window on the primary screen for predictable clicks.
 
-    Returns True if the window was moved or is already centered, False on error.
+    Why: hard-coded coordinates are more reliable when the app window is roughly
+    centered on the primary monitor. This reduces drift when the user previously
+    moved or resized the window.
+
+    Returns True if the window was moved or already near center, False on error.
     """
     try:
         screen_w, screen_h = pyautogui.size()
@@ -124,10 +138,13 @@ def _center_qt_window(win) -> bool:
         return False
 
 def ensure_qt_open_and_centered(*, login_if_launched: bool = True) -> bool:
-    """Ensure QT Insite is open, active, and centered.
+    """Make sure QT Insite is open, focused, and centered before clicking.
 
-    - If window not found: launch, activate, optionally run login sequence.
-    - If found: activate and center if needed.
+    Behavior:
+    - Not open: launch, focus, and optionally log in
+    - Already open: focus and center the window
+    - Always aborts early if STOP_EVENT is set
+
     Returns True when ready for GUI interactions, False on failure/stop.
     """
     if STOP_EVENT.is_set():
@@ -172,9 +189,10 @@ def launch_qtinsite_using_shortcut_style(wait: float = 6.0) -> bool:
         return False
 
 def click_at(x: int, y: int, dur: float = MOVE_DURATION):
-    """
-    Move mouse to coordinates and click, but abort quickly if STOP_EVENT set.
-    Use a short capped move duration to avoid long blocking moveTo.
+    """Move to (x, y) and click, honoring STOP_EVENT at each small step.
+
+    We split waits into short slices so a stop request cancels immediately
+    instead of waiting for long sleeps/movements to finish.
     """
     if STOP_EVENT.is_set():
         return
@@ -281,8 +299,8 @@ class AutomationWorker(QtCore.QThread):
         - Set voltage: double-click field, delete, type value
         - Save
         - Go to Reporting tab
-        - For CSV path: select by click-drag 400px to the right, delete, type new path '.../Test_$D_$T.csv'
-        - For PDF path: same but '.../PDFTest_$D_$T.pdf'
+        - For CSV path: click, press Ctrl+A to select all, Backspace to clear, type '.../Test_$D_$T.csv'
+        - For PDF path: click, press Ctrl+A to select all, Backspace to clear, type '.../PDFTest_$D_$T.pdf'
         """
         if self.stop_flag or STOP_EVENT.is_set():
             return
@@ -301,27 +319,6 @@ class AutomationWorker(QtCore.QThread):
                 time.sleep(step)
                 elapsed += step
             return True
-
-        # Helper: drag selection from a start point by dx,dy
-        def _drag_from(x: int, y: int, dx: int, dy: int):
-            if self.stop_flag or STOP_EVENT.is_set():
-                return
-            try:
-                pyautogui.moveTo(x, y, duration=MOVE_DURATION)
-                if not _pause():
-                    return
-                pyautogui.mouseDown()
-                if not _pause():
-                    pyautogui.mouseUp()
-                    return
-                pyautogui.moveRel(dx, dy, duration=MOVE_DURATION)
-                if not _pause():
-                    pyautogui.mouseUp()
-                    return
-                pyautogui.mouseUp()
-                _pause()
-            except Exception:
-                return
 
         # 1) Ensure window active and centered (launch+login if needed)
         if not ensure_qt_open_and_centered(login_if_launched=True):
@@ -405,7 +402,7 @@ class AutomationWorker(QtCore.QThread):
         if self.stop_flag or STOP_EVENT.is_set():
             return
 
-        # 6) CSV path: click start, Ctrl+A to select all, delete, type
+        # 6) CSV path: click, Ctrl+A, Backspace, type
         try:
             cx, cy = c["test_sequence_csv_path_start"]
             click_at(cx, cy)
@@ -426,7 +423,7 @@ class AutomationWorker(QtCore.QThread):
         if self.stop_flag or STOP_EVENT.is_set():
             return
 
-        # 7) PDF path: click start, Ctrl+A to select all, delete, type
+        # 7) PDF path: click, Ctrl+A, Backspace, type
         try:
             px, py = c["test_sequence_pdf_path_start"]
             click_at(px, py)
@@ -696,6 +693,10 @@ class MainWindow(QtWidgets.QWidget):
             pix = QtGui.QPixmap(str(logo_path)).scaled(
                 200, 100, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation
             )
+        else:
+            # Fallback placeholder if the logo asset isn't present
+            pix = QtGui.QPixmap(200, 100)
+            pix.fill(QtGui.QColor(ACCENT_RED))
         logo_lbl.setPixmap(pix)
         logo_container = QtWidgets.QHBoxLayout()
         logo_container.addStretch()

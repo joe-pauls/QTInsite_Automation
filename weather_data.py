@@ -94,45 +94,7 @@ def _get_airport_name(icao_code: str) -> str:
     return icao_code
 
 
-def _calculate_tick_frequency(start: pd.Timestamp, end: pd.Timestamp) -> str:
-    """Return an appropriate tick frequency string for a time span."""
-    span_hours = max(0.0, (end - start).total_seconds() / 3600.0)
-
-    if span_hours <= 2:
-        return "10min"
-    if span_hours <= 6:
-        return "15min"
-    if span_hours <= 24:
-        return "1h"
-    return "1d"
-
-
-def _align_tick_start(start: pd.Timestamp, freq: str) -> pd.Timestamp:
-    """
-    Align tick start time to frequency boundary.
-    
-    Args:
-        start: Start timestamp
-        freq: Frequency string from _calculate_tick_frequency
-        
-    Returns:
-        Aligned timestamp
-    """
-    ts = pd.to_datetime(start)
-    freq_lower = freq.lower()
-
-    if freq_lower.endswith("h"):
-        return ts.floor("h")
-    if freq_lower.endswith("d"):
-        return ts.floor("d")
-    if freq_lower.endswith("min"):
-        minutes = int(freq_lower.replace("min", ""))
-        return ts - pd.Timedelta(
-            minutes=(ts.minute % minutes),
-            seconds=ts.second,
-            microseconds=ts.microsecond
-        )
-    return ts
+# (Removed unused tick frequency helpers to keep this module lean.)
 
 
 def _create_day_separators(days: pd.DatetimeIndex, start: pd.Timestamp,
@@ -182,28 +144,7 @@ def _create_day_separators(days: pd.DatetimeIndex, start: pd.Timestamp,
     return shapes
 
 
-def _create_date_annotations(datetimes: pd.Series, y_position: float = DATE_LABEL_Y_POSITION) -> list:
-    """
-    Create MM/DD date label annotations for first measurement of each day.
-    
-    Args:
-        datetimes: Series of datetime values
-        y_position: Vertical position relative to plot (paper coordinates)
-        
-    Returns:
-        List of plotly annotation dictionaries
-    """
-    first_per_day = datetimes.groupby(datetimes.dt.floor("D")).min().tolist()
-    
-    annotations = []
-    for first_time in first_per_day:
-        annotations.append(dict(
-            x=first_time, y=y_position, xref="x", yref="paper",
-            text=pd.to_datetime(first_time).strftime("%m/%d"), showarrow=False,
-            font=dict(size=DATE_LABEL_FONT_SIZE, family="Arial", color=DARK_GRAY)
-        ))
-    
-    return annotations
+# (Removed an unused date annotation helper; plots build labels inline for clarity.)
 
 
 # ========== PUBLIC API FUNCTIONS ==========

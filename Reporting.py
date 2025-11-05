@@ -163,65 +163,16 @@ def collect_measurements():
 
     return result_df
 
-
-def _calculate_tick_frequency(start: datetime, end: datetime) -> str:
-    """
-    Determine appropriate tick frequency based on time span.
-    
-    Args:
-        start: Start datetime
-        end: End datetime
-        
-    Returns:
-        Frequency string ('10min', '15min', '30min', or '1d')
-    """
-    span_hours = (end - start).total_seconds() / 3600
-    
-    if span_hours <= 2:
-        return "10min"
-    elif span_hours <= 6:
-        return "15min"
-    elif span_hours <= 24:
-        return "30min"
-    else:
-        return "1d"
-
-
-def _align_tick_start(start: datetime, freq: str) -> datetime:
-    """
-    Align tick start time to frequency boundary.
-    
-    Args:
-        start: Start datetime
-        freq: Frequency string
-        
-    Returns:
-        Aligned datetime
-    """
-    tick_start = pd.to_datetime(start)
-    freq_lower = freq.lower()
-
-    if freq_lower.endswith("h"):
-        return tick_start.floor("h")
-    if freq_lower.endswith("d"):
-        return tick_start.floor("d")
-    if freq_lower.endswith("min"):
-        minutes = int(freq_lower.replace("min", ""))
-        return tick_start - pd.Timedelta(
-            minutes=(tick_start.minute % minutes),
-            seconds=tick_start.second,
-            microseconds=tick_start.microsecond
-        )
-    return tick_start
-
-
 def _create_day_separators(days: pd.DatetimeIndex, start: datetime, end: datetime) -> list:
-    """Create vertical line shapes for day boundaries plus intermediate 6-hour guides."""
+    """Return vertical line shapes marking day boundaries and 6-hour guides.
+
+    This keeps resistance/weather plots visually aligned and easier to read.
+    """
     shapes: list[dict] = []
     start_dt = pd.to_datetime(start)
     end_dt = pd.to_datetime(end)
 
-    # Ensure we know the midnight boundaries that should get the stronger styling
+    # Stronger lines at midnight boundaries
     major_lines: set[pd.Timestamp] = set()
     for day in pd.to_datetime(days):
         boundary = pd.to_datetime(day).floor("D")
@@ -234,11 +185,12 @@ def _create_day_separators(days: pd.DatetimeIndex, start: datetime, end: datetim
                 y0=0,
                 y1=1,
                 yref="paper",
-                line=dict(color=LIGHT_GRAY, width=1.2),  # Solid line
+                line=dict(color=LIGHT_GRAY, width=1.2),
                 opacity=0.45,
             ))
             major_lines.add(boundary)
 
+    # Lighter dashed lines every 6 hours for context
     window_start = start_dt.floor("D")
     window_end = end_dt.ceil("D")
     minor_times = pd.date_range(start=window_start, end=window_end, freq=f"{MINOR_SEPARATOR_HOURS}H")
@@ -255,47 +207,11 @@ def _create_day_separators(days: pd.DatetimeIndex, start: datetime, end: datetim
                 y0=0,
                 y1=1,
                 yref="paper",
-                line=dict(color=LIGHT_GRAY, width=1.0, dash="dash"),  # Dashed line
+                line=dict(color=LIGHT_GRAY, width=1.0, dash="dash"),
                 opacity=0.45,
             ))
 
     return shapes
-
-
-def _create_date_annotations(datetimes: pd.Series, start: datetime, end: datetime,
-                            y_position: float = DATE_LABEL_Y_POSITION) -> list:
-    """
-    Create MM/DD date label annotations for first measurement of each day.
-    
-    Args:
-        datetimes: Series of datetime values
-        start: Plot start time
-        end: Plot end time
-        y_position: Vertical position relative to plot (paper coordinates)
-        
-    Returns:
-        List of plotly annotation dictionaries
-    """
-    first_per_day = (
-        datetimes.dt.floor("D")
-        .drop_duplicates()
-        .reset_index(drop=True)
-    )
-    
-    # Map each day to its first occurrence in the original series
-    first_times = datetimes.groupby(datetimes.dt.floor("D")).min()
-    
-    annotations = []
-    for day in first_per_day:
-        first_time = first_times.loc[day]
-        if start <= first_time <= end:
-            annotations.append(dict(
-                x=first_time, y=y_position, xref="x", yref="paper",
-                text=first_time.strftime("%m/%d"), showarrow=False,
-                font=dict(size=16, family="Arial", color=DARK_GRAY)
-            ))
-    
-    return annotations
 
 
 def _infer_circuit_configuration() -> str:
