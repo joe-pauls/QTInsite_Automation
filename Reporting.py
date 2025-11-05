@@ -32,7 +32,7 @@ import weather_data
 # When running this file directly, we keep a hardcoded default input directory.
 # When called from main.py, INPUT_DIR will be set to the timestamped output folder
 # created by the app, and outputs will go into a "Summary" subfolder inside it.
-DEFAULT_INPUT_DIR = Path(r"C:\Users\user\Desktop\QTInsite_Automation\QTInsite_Automation\1700VDwell60")
+DEFAULT_INPUT_DIR = Path(r"C:\Users\user\Downloads\TestCSV\10_14_Test_750V\10_14_Test-2000")
 DEFAULT_OUTPUT_ROOT = DEFAULT_INPUT_DIR / "Summary"
 
 INPUT_DIR = DEFAULT_INPUT_DIR
@@ -116,78 +116,6 @@ def get_default_output_root() -> Path:
     """
     return Path.cwd() / "Outputs"
 
-
-def generate_recent_weather_preview(
-    *,
-    days: int = 7,
-    icao_code: str = "KCUB",
-    output_dir: Path | str | None = None,
-    rain_axis_max: float | None = None,
-) -> Path | None:
-    """Fetch recent weather from the API and create a standalone preview plot.
-
-    Args:
-        days: Number of days of history to include (default 7)
-        icao_code: Weather station ICAO identifier (default KCUB)
-        output_dir: Optional target directory for preview artifacts
-        rain_axis_max: Optional rainfall axis ceiling in inches for scaling bars
-    """
-    if days <= 0:
-        raise ValueError("days must be positive")
-
-    # Determine date range
-    end_dt = datetime.now()
-    start_dt = end_dt - timedelta(days=days)
-    start_str = start_dt.strftime("%Y-%m-%d")
-    end_str = end_dt.strftime("%Y-%m-%d")
-
-    try:
-        hourly_df, daily_df, airport_name = weather_data.get_hourly_weather(
-            start_str, end_str, icao_code=icao_code
-        )
-    except RuntimeError as exc:  # Missing dependencies or API issues
-        print(f"[ERROR] Weather preview failed: {exc}")
-        return None
-    except Exception as exc:
-        print(f"[ERROR] Weather preview failed with unexpected error: {exc}")
-        return None
-
-    # Reuse weather plotting with minimal transformation
-    preview_df = hourly_df.rename(columns={"date": "matched_hour"}).copy()
-    preview_df["matched_hour"] = pd.to_datetime(preview_df["matched_hour"])
-
-    if output_dir is None:
-        target_dir = get_default_output_root() / "weather_previews"
-    else:
-        target_dir = Path(output_dir)
-    target_dir.mkdir(parents=True, exist_ok=True)
-
-    out_path = target_dir / f"weather_preview_last_{days}_days.png"
-    csv_path = target_dir / f"weather_preview_last_{days}_days.csv"
-
-    # Export raw hourly weather data for inspection
-    try:
-        hourly_df.to_csv(csv_path, index=False)
-    except Exception as exc:
-        print(f"[WARN] Failed to save weather preview CSV: {exc}")
-        csv_path = None
-
-    ok = weather_data.create_weather_plot_png(
-        preview_df,
-        daily_df,
-        str(out_path),
-        title=f"{airport_name} Weather — Last {days} Days",
-        rain_axis_max=rain_axis_max,
-        station_label=airport_name,
-    )
-
-    if ok:
-        print(f"[OK] Weather preview plot saved to: {out_path}")
-        if csv_path:
-            print(f"[OK] Weather preview CSV saved to: {csv_path}")
-        return out_path
-
-    return None
 
 
 def extract_datetime_from_filename(fname: str):
@@ -867,6 +795,40 @@ def integrate_weather(df: pd.DataFrame, output_dir: Path, icao: str = "KCUB") ->
         return None, None, None
 
 
+def _compute_previous_3day_rainfall(end_dt: datetime | None, icao: str = "KCUB") -> float | None:
+    """Compute total rainfall (inches) for the previous 3 calendar days (daily totals).
+
+    Uses daily precipitation sums from weather_data.get_hourly_weather and sums
+    the last three days up to end_dt (inclusive). Returns None if unavailable.
+    """
+    try:
+        if end_dt is None or pd.isna(end_dt):
+            end_dt = datetime.now()
+        # Request from 3 days ago through end date (API fetches 7 extra pre-days internally)
+        start_dt = (pd.to_datetime(end_dt) - timedelta(days=3))
+        start_str = pd.to_datetime(start_dt).strftime("%Y-%m-%d")
+        end_str = pd.to_datetime(end_dt).strftime("%Y-%m-%d")
+        try:
+            _hourly_df, daily_df, _airport = weather_data.get_hourly_weather(start_str, end_str, icao_code=icao)
+        except TypeError:
+            _hourly_df, daily_df, _airport = weather_data.get_hourly_weather(start_str, end_str, icao)
+        if daily_df is None or daily_df.empty:
+            return None
+
+        # Sum the last three calendar days using daily precipitation totals
+        daily = daily_df.copy()
+        daily["date_only"] = pd.to_datetime(daily["date"]).dt.date
+        end_date = pd.to_datetime(end_dt).date()
+        start_date = end_date - timedelta(days=2)
+        mask = (daily["date_only"] >= start_date) & (daily["date_only"] <= end_date)
+        vals = pd.to_numeric(daily.loc[mask, "precipitation_sum"], errors="coerce").dropna()
+        if vals.empty:
+            return None
+        return float(vals.sum())
+    except Exception:
+        return None
+
+
 def _enrich_with_weather(df: pd.DataFrame, matched: pd.DataFrame | None) -> pd.DataFrame:
     """Merge matched weather metrics with resistance data frame."""
     if matched is None or matched.empty:
@@ -993,6 +955,7 @@ def build_pdf_report(
     normalized_plot_ok: bool,
     weather_plot_ok: bool,
     airport_name: str | None = None,
+    previous_3day_rain_in: float | None = None,
 ):
     """
     Generate professional PDF report with Atlantic Electric branding.
@@ -1118,8 +1081,15 @@ def build_pdf_report(
         ["Resistance (raw)", f"Min {raw_min} | Avg {raw_avg} | Max {raw_max}"],
         ["Resistance (normalized)", norm_summary],
         ["Temperature Range", temp_summary],
-        ["Total Rainfall", rain_total],
+        ["Total Rainfall (during testing)", rain_total],
     ]
+
+    # Append previous 3-day rainfall accumulation
+    if previous_3day_rain_in is None or not isinstance(previous_3day_rain_in, (int, float)):
+        prev3 = "N/A"
+    else:
+        prev3 = f"{previous_3day_rain_in:.2f} in"
+    summary_rows.append(["Rainfall Accumulation (Past 3 days)", prev3])
 
     story.append(Paragraph("Test Summary", ParagraphStyle(
         "SummaryHeading",
@@ -1306,12 +1276,21 @@ def _run_report_pipeline() -> dict[str, object]:
     print(f"Saved enriched summary to: {OUTPUT_CSV}")
 
     print("\n[5/5] Building PDF report...")
+    # Compute previous 3-day rainfall up to the test end time
+    try:
+        datetimes = pd.to_datetime(enriched_df.get("datetime"), errors="coerce").dropna().sort_values()
+        test_end = datetimes.iloc[-1] if not datetimes.empty else None
+    except Exception:
+        test_end = None
+
+    prev3_in = _compute_previous_3day_rainfall(test_end, icao="KCUB")
     build_pdf_report(
         enriched_df,
         resistance_plot_ok=resistance_plot_ok,
         normalized_plot_ok=normalized_plot_ok,
         weather_plot_ok=weather_plot_ok,
         airport_name=airport_name,
+        previous_3day_rain_in=prev3_in,
     )
 
     print("\n" + "=" * 60)
@@ -1337,7 +1316,6 @@ def generate_report(output_dir: Path | str | None = None) -> dict[str, object]:
 
 def main():
     """CLI entry point using configured defaults."""
-    generate_recent_weather_preview()
     configure_paths()
     _run_report_pipeline()
 

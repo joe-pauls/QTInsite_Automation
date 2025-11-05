@@ -5,16 +5,16 @@ Author: Joseph Pauls
 
 TODO 
 - Add checks for whether QT Insite is already running before launching or user is already logged in (auto-click logout before loggin in) 
-- Add options for user to input test voltage level, grounded/ungrounded checkbox, minimum resistance, and integrate those values into the automation sequence 
---- The same sequence will get edited every time to avoid having to make a new sequence (placeholder is edit_test_sequence function)
-- Add option to run a single test immediately to see results without scheduling (with its own configuration panel) 
+✅ Add options for user to input test voltage level, grounded/ungrounded checkbox, and integrate those values into the automation sequence 
+    - The same sequence will get edited every time to avoid having to make a new sequence (placeholder is edit_test_sequence function)
+✅ Add option to run a single test immediately to see results without scheduling (with its own configuration panel) 
 ✅ Add input box on gui for airport ICAO code or latitude and longitude coordinates for the weather data 
-- When the test is run, a new folder with the datetime is created and all files are outputted into it. The summary folder is then created inside that folder.
-- Check for rain in the past 3 days since testing and add the total rainfall amount for the past 3 days to the report summary table
-- Get rid of weather previews
-- make sure only one timestamped folder is being created when a test is run, not when the reporting is generated
+✅ When the test is run, a new folder with the datetime is created and all files are outputted into it. The summary folder is then created inside that folder.
+✅ Check for rain in the past 3 days since testing and add the total rainfall amount for the past 3 days to the report summary table
+✅ Get rid of weather previews
+✅ make sure only one timestamped folder is being created when a test is run, not when the reporting is generated
 - add check for making sure qt insite is open and logged in before running every test (in case it crashes)
-- change output path at bottom right of gui to show the current output path being used
+✅ change output path at bottom right of gui to show the current output path being used
 ✅ Make sure the stop button completely stops the automation, it seems to continue moving the mouse even after stopping
 """
 
@@ -489,6 +489,8 @@ class AutomationWorker(QtCore.QThread):
                 self.log("❌ Window not found")
                 self.finished_signal.emit(False)
                 return
+            # Ensure centered before any login typing begins
+            _center_qt_window(win)
 
             # If already open when we started, log out first
             if pre_existing and not (self.stop_flag or STOP_EVENT.is_set()):
@@ -779,7 +781,7 @@ class MainWindow(QtWidgets.QWidget):
         for lbl, sec in DURATION_UNITS:
             self.duration_unit.addItem(lbl, sec)
         self.duration_unit.setFixedHeight(36)
-        self.duration_unit.setFixedWidth(110)
+        self.duration_unit.setFixedWidth(150)
         dur_box.addWidget(dur_label)
         dur_box.addWidget(self.duration_spin)
         dur_box.addWidget(self.duration_unit)
@@ -790,7 +792,7 @@ class MainWindow(QtWidgets.QWidget):
         int_box = QtWidgets.QHBoxLayout()
         int_box.setAlignment(QtCore.Qt.AlignVCenter)
         int_label = QtWidgets.QLabel("Interval:")
-        int_label.setMinimumWidth(120)
+        int_label.setMinimumWidth(150)
         int_label.setFixedHeight(36)
         self.interval_spin = QtWidgets.QSpinBox()
         self.interval_spin.setRange(1, 1000000)
@@ -801,7 +803,7 @@ class MainWindow(QtWidgets.QWidget):
         for lbl, sec in INTERVAL_UNITS:
             self.interval_unit.addItem(lbl, sec)
         self.interval_unit.setFixedHeight(36)
-        self.interval_unit.setFixedWidth(110)
+        self.interval_unit.setFixedWidth(150)
         int_box.addWidget(int_label)
         int_box.addWidget(self.interval_spin)
         int_box.addWidget(self.interval_unit)
@@ -845,13 +847,13 @@ class MainWindow(QtWidgets.QWidget):
         icao_label = QtWidgets.QLabel("Airport ICAO Code:")
         icao_label.setFixedWidth(150)
         icao_label.setFixedHeight(36)
-        icao_label.setAlignment(QtCore.Qt.AlignVCenter)
+        # icao_label.setAlignment(QtCore.Qt.AlignVCenter)
         self.icao_input = QtWidgets.QLineEdit("KCUB")
         self.icao_input.setPlaceholderText("e.g. KCUB")
         self.icao_input.setMaxLength(4)
         self.icao_input.setFixedHeight(36)
         self.icao_input.setFixedWidth(90)
-        self.icao_input.setAlignment(QtCore.Qt.AlignVCenter)
+        # self.icao_input.setAlignment(QtCore.Qt.AlignVCenter)
         self.icao_input.setToolTip("Enter the 4-letter ICAO code for the nearest airport (e.g., KCUB)")
         icao_row.addWidget(icao_label)
         icao_row.addWidget(self.icao_input)

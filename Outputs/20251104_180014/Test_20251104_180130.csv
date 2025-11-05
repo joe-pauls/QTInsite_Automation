@@ -1,0 +1,4 @@
+﻿HDR,0,,,testuser,11/4/25,18:01:30,V73,39402,v1.30,
+Step Type,Status Flag,Attempted?,Dwell Time (s),Test Drive Level (V/A),Actual Drive Level (V/A),Test Frequency (Hz),Min Limit (A/Ω),Max Limit (A/Ω),Final Measurement (A/Ω),Highest BKDN (Apk),ARC Limit (A),Highest ARC (A)
+IR,0,Y,60.0,1400.0,+1.4000E+03,,1.0E8,,+140.00E+06,,,
+END
