@@ -32,7 +32,7 @@ import weather_data
 # When running this file directly, we keep a hardcoded default input directory.
 # When called from main.py, INPUT_DIR will be set to the timestamped output folder
 # created by the app, and outputs will go into a "Summary" subfolder inside it.
-DEFAULT_INPUT_DIR = Path(r"C:\Users\user\Downloads\TestCSV\10_14_Test_750V\10_14_Test-2000")
+DEFAULT_INPUT_DIR = Path(r"C:\Users\pauls\Downloads\20251112_085536\20251112_085536")
 DEFAULT_OUTPUT_ROOT = DEFAULT_INPUT_DIR / "Summary"
 
 INPUT_DIR = DEFAULT_INPUT_DIR
@@ -212,21 +212,6 @@ def _create_day_separators(days: pd.DatetimeIndex, start: datetime, end: datetim
             ))
 
     return shapes
-
-
-def _infer_circuit_configuration() -> str:
-    """Infer circuit grounding from file naming conventions."""
-    try:
-        first_file = next(INPUT_DIR.glob("*.csv"))
-    except StopIteration:
-        return "Unknown"
-
-    name = first_file.stem.lower()
-    if "ungrounded" in name or "un_grounded" in name:
-        return "Ungrounded"
-    if "grounded" in name:
-        return "Grounded"
-    return "Unknown"
 
 
 def _format_duration(delta: timedelta | pd.Timedelta | None) -> str:
@@ -872,6 +857,7 @@ def build_pdf_report(
     weather_plot_ok: bool,
     airport_name: str | None = None,
     previous_3day_rain_in: float | None = None,
+    test_voltage: int | str | None = None,
 ):
     """
     Generate professional PDF report with Atlantic Electric branding.
@@ -985,12 +971,19 @@ def build_pdf_report(
     else:
         rain_total = f"{rain_series.sum():.2f} in"
 
-    circuit_config = _infer_circuit_configuration()
+    # Determine displayed test voltage: prefer explicit user input, fallback to inference
+    if test_voltage is not None:
+        if isinstance(test_voltage, (int, float)):
+            test_voltage_display = f"{int(test_voltage)} V"
+        else:
+            tv = str(test_voltage).strip()
+            test_voltage_display = tv if tv.upper().endswith("V") else tv + " V"
+    else:
+        test_voltage_display = "1500 V"
 
     summary_rows = [
         ["Metric", "Value"],
-        ["Test Voltage", "2500 V"],
-        ["Circuit Configuration", circuit_config],
+        ["Test Voltage", test_voltage_display],
         ["Measurement Window", window_str],
         ["Test Duration", duration_str],
         ["Sampling Frequency", sampling_freq],
@@ -1166,7 +1159,7 @@ def build_pdf_report(
 
 
 
-def _run_report_pipeline() -> dict[str, object]:
+def _run_report_pipeline(test_voltage: int | str | None = None) -> dict[str, object]:
     """Execute complete report workflow and return artifact summary."""
     print("=" * 60)
     print("Circuit Integrity Report Generator")
@@ -1207,6 +1200,7 @@ def _run_report_pipeline() -> dict[str, object]:
         weather_plot_ok=weather_plot_ok,
         airport_name=airport_name,
         previous_3day_rain_in=prev3_in,
+        test_voltage=test_voltage,
     )
 
     print("\n" + "=" * 60)
@@ -1224,10 +1218,15 @@ def _run_report_pipeline() -> dict[str, object]:
     }
 
 
-def generate_report(output_dir: Path | str | None = None) -> dict[str, object]:
-    """Entry point for other scripts to run the report pipeline with a target directory."""
+def generate_report(output_dir: Path | str | None = None, *, test_voltage: int | str | None = None) -> dict[str, object]:
+    """Entry point for other scripts to run the report pipeline.
+
+    Args:
+        output_dir: Timestamped folder containing test CSVs (created by main GUI)
+        test_voltage: User-provided test voltage from GUI spin box (overrides inference)
+    """
     configure_paths(output_dir=output_dir)
-    return _run_report_pipeline()
+    return _run_report_pipeline(test_voltage=test_voltage)
 
 
 def main():
