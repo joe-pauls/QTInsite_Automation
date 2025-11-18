@@ -557,7 +557,7 @@ class AutomationWorker(QtCore.QThread):
                     self.log(f"📊 Generating report in {self.output_dir}...")
                     self.report_signal.emit("Generating report, please wait...")
                     try:
-                        result = Reporting.generate_report(self.output_dir)
+                        result = Reporting.generate_report(self.output_dir, test_voltage=self.test_voltage)
                         pdf_path = result.get("pdf")
                         self.report_signal.emit("✅ Report generated successfully!")
                         if pdf_path:
