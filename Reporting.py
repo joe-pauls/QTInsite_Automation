@@ -773,7 +773,8 @@ def _enrich_with_weather(df: pd.DataFrame, matched: pd.DataFrame | None) -> pd.D
 
     enriched.drop(columns=["_datetime_local", "res_datetime"], inplace=True, errors="ignore")
 
-    enriched["temperature_f"] = pd.to_numeric(enriched.get("temperature_2m"), errors="coerce")
+    # Store temperature as Celsius (API now returns Celsius)
+    enriched["temperature_c"] = pd.to_numeric(enriched.get("temperature_2m"), errors="coerce")
     enriched["relative_humidity_percent"] = pd.to_numeric(
         enriched.get("relative_humidity_2m"), errors="coerce"
     )
@@ -784,17 +785,16 @@ def _enrich_with_weather(df: pd.DataFrame, matched: pd.DataFrame | None) -> pd.D
 
 
 def _compute_normalized_resistance(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute resistance normalized to 40°C using provided temperature column."""
-    if "temperature_f" not in df.columns:
+    """Compute resistance normalized to 40°C using Celsius temperature column."""
+    if "temperature_c" not in df.columns:
         df["resistance_normalized_40c"] = pd.NA
         return df
 
     def _norm(row):
-        temp_f = row.get("temperature_f")
+        temp_c = row.get("temperature_c")
         resistance = row.get("resistance")
-        if pd.isna(temp_f) or pd.isna(resistance):
+        if pd.isna(temp_c) or pd.isna(resistance):
             return pd.NA
-        temp_c = (temp_f - 32) * (5.0 / 9.0)
         kt = 0.5 * math.exp((40 - temp_c) / 10)
         try:
             return float(resistance) * kt
@@ -971,13 +971,13 @@ def build_pdf_report(
     else:
         norm_summary = "N/A"
 
-    temp_series = pd.to_numeric(df.get("temperature_f"), errors="coerce")
+    temp_series = pd.to_numeric(df.get("temperature_c"), errors="coerce")
     if temp_series.dropna().empty:
         temp_summary = "N/A"
     else:
         temp_min = temp_series.min()
         temp_max = temp_series.max()
-        temp_summary = f"{temp_min:.1f} °F to {temp_max:.1f} °F"
+        temp_summary = f"{temp_min:.1f} °C to {temp_max:.1f} °C"
 
     rain_series = pd.to_numeric(df.get("precipitation_in"), errors="coerce")
     if rain_series.dropna().empty:
@@ -1102,7 +1102,7 @@ def build_pdf_report(
         "Date",
         "Resistance",
         "Normalized (40°C)",
-        "Temp (°F)",
+        "Temp (°C)",
         "Humidity (%)",
         "Rainfall (in)"
     ]]
@@ -1116,7 +1116,7 @@ def build_pdf_report(
         res_str = _format_resistance_value(row.get("resistance"))
         norm_str = _format_resistance_value(row.get("resistance_normalized_40c"))
 
-        temp_val = row.get("temperature_f")
+        temp_val = row.get("temperature_c")
         hum_val = row.get("relative_humidity_percent")
         rain_val = row.get("precipitation_in")
 

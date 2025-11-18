@@ -205,7 +205,8 @@ def get_hourly_weather(start_date: str, end_date: str, icao_code: str = "KCUB"):
         "end_date": pd.to_datetime(end_date).strftime('%Y-%m-%d'),
         "hourly": ["temperature_2m", "relative_humidity_2m", "precipitation"],
         "daily": ["precipitation_sum"],
-        "temperature_unit": "fahrenheit",
+        # Request temperatures in Celsius instead of Fahrenheit
+        "temperature_unit": "celsius",
         "precipitation_unit": "inch",
     }
 
@@ -265,7 +266,7 @@ def match_weather_to_resistance(res_df: pd.DataFrame, hourly_df: pd.DataFrame) -
         DataFrame with columns:
         - res_datetime: Original resistance measurement datetime
         - matched_hour: Rounded hour matched to weather data
-        - temperature_2m: Temperature in °F
+        - temperature_2m: Temperature in °C
         - relative_humidity_2m: Relative humidity percentage
         - precipitation: Precipitation in inches
         
@@ -355,7 +356,7 @@ def create_weather_plot_png(
     """
     Generate weather plot PNG with Atlantic Electric branding.
     
-    Creates a dual-axis plot showing temperature (°F) on left axis and humidity (%)/
+    Creates a dual-axis plot showing temperature (°C) on left axis and humidity (%)/
     precipitation (in) on right axis. Includes day separators and MM/DD date labels,
     with styling matching the resistance plot.
     
@@ -495,12 +496,12 @@ def create_weather_plot_png(
     # Temperature trace (left y-axis)
     fig.add_trace(go.Scatter(
         x=x, y=temp, 
-        name="Temperature (°F)", 
+        name="Temperature (°C)", 
         mode="lines+markers",
         line=dict(color=TEMP_COLOR, width=2.5),
         marker=dict(size=7, color=TEMP_COLOR),
         yaxis="y1",
-        hovertemplate="%{x|%b %d %H:%M}<br>Temp: %{y:.1f}°F<extra></extra>"
+        hovertemplate="%{x|%b %d %H:%M}<br>Temp: %{y:.1f}°C<extra></extra>"
     ))
 
     # Humidity trace (right y-axis)
@@ -589,7 +590,7 @@ def create_weather_plot_png(
     # Left axis: Temperature
     fig.update_yaxes(
         title=dict(
-            text="Temperature (°F)", 
+            text="Temperature (°C)", 
             font=dict(size=AXIS_LABEL_FONT_SIZE, family="Arial", color=TEMP_COLOR)
         ),
         tickfont=dict(size=TICK_FONT_SIZE, family="Arial", color=TEMP_COLOR),
